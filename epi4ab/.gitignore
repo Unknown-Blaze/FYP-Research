@@ -1,0 +1,9 @@
+output/
+__pycache__
+.rescache
+.ipynb_checkpoints
+.DS_Store
+**/pdb_list
+**/suggestion.py
+.venv/
+data/

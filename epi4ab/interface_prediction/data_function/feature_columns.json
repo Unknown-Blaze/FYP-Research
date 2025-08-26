@@ -1,0 +1,58 @@
+{
+  "v1.0.1": {
+    "Ag_features": {
+      "continuous": [
+        "resDepth",
+        "bFactor",
+        "sasa",
+        "phi",
+        "psi",
+        "charge",
+        "hydrophobicity",
+        "polarity",
+        "volume"
+      ],
+      "onehot": [
+        "isALA", "isCYS", "isASP", "isGLU", "isPHE", "isGLY", "isHIS", "isILE", "isLYS", "isLEU", "isMET", "isASN", "isPRO", "isGLN", "isARG", "isSER", "isTHR", "isVAL", "isTRP", "isTYR"
+      ]
+    },
+    "Ab_features": {
+      "continuous": [],
+      "onehot_vh": [
+        "IGHV1", "IGHV3", "IGHV5", "IGHV4", "IGHV8", "IGHV7", "IGHV6", "IGHV9", "IGHV14", "unknown_VH"
+      ],
+      "onehot_vl": [
+        "IGKV1", "IGLV2", "IGLV3", "IGKV3", "IGKV12", "IGKV4", "IGLV1", "IGKV5", "IGKV8", "IGKV10", "IGKV6", "IGKV1D", "IGKV16", "unknown_VL"
+      ],
+      "AA_short": ["A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"]
+    }
+  },
+  "v1.0.2": {
+    "Ag_features": {
+      "continuous": [
+        "resDepth",
+        "bFactor",
+        "sasa",
+        "phi",
+        "psi",
+        "charge",
+        "hydrophobicity",
+        "polarity",
+        "volume"
+      ],
+      "onehot": [
+        "isALA", "isCYS", "isASP", "isGLU", "isPHE", "isGLY", "isHIS", "isILE", "isLYS", "isLEU", "isMET", "isASN", "isPRO", "isGLN", "isARG", "isSER", "isTHR", "isVAL", "isTRP", "isTYR"
+      ]
+    },
+    "Ab_features": {
+      "continuous": [],
+      "onehot_vh": [
+        "IGHV1", "IGHV3", "IGHV5", "IGHV4", "IGHV8", "IGHV7", "IGHV6", "IGHV9", "IGHV14", "unknown_VH"
+      ],
+      "onehot_vl": [
+        "IGKV1", "IGLV2", "IGLV3", "IGKV3", "IGKV12", "IGKV4", "IGLV1", "IGKV5", "IGKV8", "IGKV10", "IGKV6", "IGKV1D", "IGKV16", "unknown_VL"
+      ],
+      "AA_short": ["A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"]
+    }
+  }
+}

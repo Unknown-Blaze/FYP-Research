@@ -1,0 +1,28 @@
+# Core Telegram and Environment Libraries
+telethon>=1.28.0
+python-dotenv>=1.0.0
+
+# AI/ML Libraries
+torch>=2.0.0
+transformers>=4.30.0
+peft>=0.4.0
+datasets>=2.12.0
+
+# Google AI (for Gemini integration)
+google-generativeai>=0.3.0
+
+# Jupyter and Development
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# Optional: For advanced model training
+accelerate>=0.20.0
+bitsandbytes>=0.41.0
+scipy>=1.10.0
+numpy>=1.24.0
+
+# Optional: For better performance
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+
+flash_attn 

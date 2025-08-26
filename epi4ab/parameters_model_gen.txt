@@ -1,0 +1,12 @@
+use_pretrained = yes
+freeze_pretrained = yes
+pretrained_model = ESM2_t12
+use_struct = yes
+use_antiberty = no
+model_name = GNNResNet
+model_block = GNNResNetBlock_Cheb
+train_all = yes
+epoch = 50
+batch_size = 4
+learning_rate = 0.0001
+save_model = yes
