@@ -1,0 +1,15 @@
+[submodule "CapsNet-MHC"]
+	path = CapsNet-MHC
+	url = ./CapsNet-MHC
+[submodule "ConvNeXt-MHC"]
+	path = ConvNeXt-MHC
+	url = ./ConvNeXt-MHC
+[submodule "DeepMHCI"]
+	path = DeepMHCI
+	url = ./DeepMHCI
+[submodule "epi4ab"]
+	path = epi4ab
+	url = ./epi4ab
+[submodule "try"]
+	path = try
+	url = ./try
