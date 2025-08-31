@@ -1,5 +1,5 @@
-22-10-22 08:27 - [Encoding method2]: blosum
-22-10-22 08:27 - [max_len_hla]: 385
-22-10-22 08:27 - [max_len_pep]: 15
-22-10-22 08:28 - [Testing result file]: /content/drive/MyDrive/CapsMHC/codes_IEDB/test_IEDB/weekly_result.txt
-22-10-22 08:28 - [Testing metric result file]: /content/drive/MyDrive/CapsMHC/codes_IEDB/test_IEDB/weekly_result_METRICS.txt
+25-08-30 14:55 - [Encoding method2]: blosum
+25-08-30 14:55 - [max_len_hla]: 385
+25-08-30 14:55 - [max_len_pep]: 15
+25-08-30 14:55 - [Testing result file]: /home3/rudrapra001/FYP-Research/CapsNet-MHC/codes/IEDB_codes/IEDB_test/weekly_result.txt
+25-08-30 14:55 - [Testing metric result file]: /home3/rudrapra001/FYP-Research/CapsNet-MHC/codes/IEDB_codes/IEDB_test/weekly_result_METRICS.txt
