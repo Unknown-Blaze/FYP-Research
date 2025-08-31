@@ -17,3 +17,6 @@ dependencies:
     - tensorboard
     - six
     - argparse
+    - pandas
+    - matplotlib
+    - seaborn

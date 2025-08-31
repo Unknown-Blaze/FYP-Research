@@ -92,15 +92,26 @@ def output_epitope_res(mhc_names, targets, scores, output_path: Path):
 
 def output_results_by_len(scores_list, test_truth, test_mhc_name, peptide_len, res_path, test_file_name, eval_func='allele'):
     test_truth, test_mhc_name, peptide_len = np.asarray(test_truth), np.asarray(test_mhc_name), np.asarray(peptide_len)
-    for targetlen in [8, 9, 10, 11, 12]:
-        if targetlen < 12:
+    # You can even make this loop dynamic if you want
+    # for targetlen in sorted(np.unique(peptide_len)):
+    for targetlen in [8, 9, 10, 11, 12, 13, 14, 15]: # Or whatever lengths you expect
+        if targetlen < 12: # Your original logic
             pick_id = peptide_len == targetlen
         else:
             pick_id = peptide_len >= targetlen
+
+        # --- ADD THIS CHECK ---
+        if not np.any(pick_id):
+            logger.info(f'No peptides of length {targetlen} (or greater) found in the test set. Skipping.')
+            continue # Skip to the next iteration of the loop
+        # --- END OF FIX ---
+
         avg_scores_list = np.mean(scores_list, axis=0)
         try:
             logger.info(F'{targetlen}-mer metric by {eval_func}')
             output_res(test_mhc_name[pick_id], test_truth[pick_id], avg_scores_list[pick_id],
-                    res_path.with_name(F'{res_path.stem}-{test_file_name}-(8-12)-{targetlen}length'), eval_func)  
-        except Exception:
+                    res_path.with_name(F'{res_path.stem}-{test_file_name}-(8-15)-{targetlen}length'), eval_func)  
+        except Exception as e:
+            # It's better to log the error than to pass silently
+            logger.error(f"Could not process metrics for length {targetlen}. Error: {e}")
             pass

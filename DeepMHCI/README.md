@@ -23,8 +23,10 @@ The commands corresponding to the different experiments are shown below.
 ```
 python main.py -d config/data.yaml -m config/model.yaml --mode 5cv -s 0 -n 10 --eval_len
 python main.py -d config/data.yaml -m config/model.yaml --mode continue-5cv -s 0 -n 10 --eval_len
+python main.py -d config/data.yaml -m config/model.yaml --mode test-5cv -s 0 -n 8 --eval_len
 python main.py -d config/data.yaml -m config/model.yaml --mode test-5cv -s 0 -n 10 --eval_len
-python main.py -d config/data.yaml -m config/model.yaml --mode epitope -s 0 -n 10 --eval_len
+python main.py -d config/data.yaml -m config/model.yaml --mode epitope -s 0 -n 8 --eval_len
+python main.py -d config/data.yaml -m config/model.yaml --mode seq2logo -s 0 -n 8 --allele HLA-A1101
 python main.py -d config/data.yaml -m config/model.yaml --mode seq2logo -s 0 -n 10 --allele HLA-A1101
 ```
 
