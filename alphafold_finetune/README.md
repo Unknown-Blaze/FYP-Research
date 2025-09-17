@@ -184,5 +184,3 @@ examples.
 templates file, it can be helpful to ignore the identities column since it won't
 match up for all the different targets. This can be done by passing
 `--ignore_identities` to `run_prediction.py`.
-
-

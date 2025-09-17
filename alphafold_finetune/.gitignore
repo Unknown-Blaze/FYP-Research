@@ -31,3 +31,11 @@ MANIFEST
 
 datasets_alphafold_finetune/
 datasets_alphafold_finetune_v2_2023-02-20.tgz
+
+saved_models/
+params/
+prediction_results/
+models_ic50/
+full_*/
+benchmark_results/
+alphafold_params_2022-12-06.tar
