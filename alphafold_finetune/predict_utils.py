@@ -172,14 +172,12 @@ def run_alphafold_prediction(
         L_prev += L_i
     feature_dict['residue_index'] = idx_res
 
-    all_metrics = predict_structure(
+    all_metrics, all_outputs = predict_structure(
         out_prefix, feature_dict, model_runners, crop_size=crop_size,
         dump_pdbs=dump_pdbs, dump_metrics=dump_metrics,
     )
-
-    #np.save('{}_plddt.npy'.format(out_prefix), plddts['model_1'])
-
-    return all_metrics
+    
+    return all_metrics, all_outputs
 
 
 def predict_structure(
@@ -206,6 +204,7 @@ def predict_structure(
     metric_tags = 'plddt ptm predicted_aligned_error'.split()
 
     all_metrics = {} # eventual return value
+    all_outputs = {}
 
     metrics = {} # stupid duplication
 
@@ -217,6 +216,8 @@ def predict_structure(
             feature_dict, random_seed=random_seed)
 
         prediction_result = model_runner.predict(processed_feature_dict)
+
+        all_outputs[model_name] = prediction_result
 
         unrelaxed_protein = protein.from_prediction(
             processed_feature_dict, prediction_result)
@@ -254,7 +255,7 @@ def predict_structure(
                 if m is not None:
                     np.save(f'{metrics_prefix}_{tag}.npy', m)
 
-    return all_metrics
+    return all_metrics, all_outputs
 
 
 def load_model_runners(
@@ -299,9 +300,13 @@ def load_model_runners(
             with open(model_params_file, 'rb') as f:
                 model_params = pickle.load(f)
 
-            model_params, other_params = hk.data_structures.partition(
+            # Keep ALL parameters - both AlphaFold and regression parameters
+            alphafold_params, other_params = hk.data_structures.partition(
                 lambda m, n, p: m[:9] == "alphafold", model_params)
-            print('ignoring other_params:', other_params)
+            print('found other_params (regression head):', list(other_params.keys()))
+            
+            # Merge both sets of parameters so the model runner has access to everything
+            model_params = {**alphafold_params, **other_params}
 
         else:
             assert '_ft' not in model_name

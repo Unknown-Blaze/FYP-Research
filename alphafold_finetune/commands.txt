@@ -23,3 +23,13 @@ python compare_ranks.py \
     --finetuned_csv full_model_prediction_results/full_model_finetuned_ranks.csv \
     --benchmark_csv benchmark_results/benchmark_ranks.csv \
     --output_csv comparison_results.csv
+
+CUDA_VISIBLE_DEVICES=2 python run_finetuning_ic50.py \
+    --data_dir /home3/rudrapra001/FYP-Research/alphafold_finetune \
+    --train_dataset datasets_alphafold_finetune/pmhc_finetune/final_train_60pct.csv \
+    --valid_dataset datasets_alphafold_finetune/pmhc_finetune/final_valid_20pct.csv \
+    --outprefix pic50_regression \
+    --output_dir ./updated_models_20_sep \
+    --num_epochs 5 \
+    --regression_loss_weight 10.0 \
+    --save_steps 500

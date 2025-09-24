@@ -1,0 +1,20 @@
+AlphaFold pIC50 Prediction Analysis Summary
+==================================================
+
+Dataset: 20_sep_pred/predictions_20_sep_fixed_final.tsv
+Ground truth: datasets_alphafold_finetune/pmhc_finetune/final_test_20pct.csv
+Number of data points: 2963
+
+Regression Performance:
+  Pearson Correlation: 0.5252 (p-value: 8.7376e-210)
+  Mean Absolute Error: 1.7086
+  Root Mean Squared Error: 1.9283
+  Bias: -1.1159
+  Std of residuals: 1.5727
+
+Classification Performance (500 nM threshold):
+  AUC: 0.7881
+  Accuracy: 0.8181
+  Precision: 0.8328
+  Recall: 0.9342
+  Specificity: 0.5222
