@@ -264,8 +264,8 @@ def main():
             hcv_with_affinity = hcv_test_df[hcv_test_df['iedb_binding_affinity_nM'].notna()].copy()
             
             # Split: 60% train, 20% validation, 20% test
-            train_df, temp_df = train_test_split(hcv_with_affinity, test_size=0.4, random_state=42)
-            valid_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
+            train_df, temp_df = train_test_split(hcv_with_affinity, test_size=0.3, random_state=42)
+            valid_df, test_df = train_test_split(temp_df, test_size=0.6667, random_state=42)
             
             print(f"Split HCV data with affinity into:")
             print(f"  - Training: {len(train_df)} samples")
@@ -295,7 +295,7 @@ def main():
     
     # --- Step 3: Also split existing training data if available ---
     print(f"\n=== Step 3: Creating held-out test set from existing training data ===")
-    train_file_path = 'datasets_alphafold_finetune/pmhc_finetune/final_train_set_pIC50.csv'
+    train_file_path = 'datasets_alphafold_finetune/pmhc_finetune/merged_pIC50_dataset.csv'
     
     try:
         full_train_df = pd.read_csv(train_file_path)
@@ -310,8 +310,8 @@ def main():
         print(f"  - Test: {len(test_df)} samples")
         
         # Save the new splits with clear names
-        train_df.to_csv('datasets_alphafold_finetune/pmhc_finetune/final_train_60pct.csv', index=False)
-        valid_df.to_csv('datasets_alphafold_finetune/pmhc_finetune/final_valid_20pct.csv', index=False)
+        train_df.to_csv('datasets_alphafold_finetune/pmhc_finetune/final_train_70pct.csv', index=False)
+        valid_df.to_csv('datasets_alphafold_finetune/pmhc_finetune/final_valid_10pct.csv', index=False)
         test_df.to_csv('datasets_alphafold_finetune/pmhc_finetune/final_test_20pct.csv', index=False)
         
         print("Saved existing data splits!")
@@ -336,8 +336,8 @@ def main():
     print("  - hcv_valid_set.csv (if enough data for splitting)")  
     print("  - hcv_test_set.csv (if enough data for splitting)")
     print("\nExisting training data splits (if file found):")
-    print("  - final_train_60pct.csv")
-    print("  - final_valid_20pct.csv")
+    print("  - final_train_70pct.csv")
+    print("  - final_valid_10pct.csv")
     print("  - final_test_20pct.csv")
 
 if __name__ == '__main__':

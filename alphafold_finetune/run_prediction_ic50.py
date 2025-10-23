@@ -1,4 +1,6 @@
-######################################################################################88
+######################################################################################
+# Enhanced AlphaFold Fine-tuning Prediction Script
+# Run template-based alphafold inference with a fine-tuned regression head
 
 FREDHUTCH_HACKS = False # silly stuff Phil added for running on Hutch servers
 if FREDHUTCH_HACKS:
@@ -10,6 +12,17 @@ if FREDHUTCH_HACKS:
     assert which('ptxas') is not None
 
 import argparse
+import os
+import sys
+from os.path import exists
+import itertools
+import numpy as np
+import pandas as pd
+import predict_utils
+import jax
+import jax.numpy as jnp
+import haiku as hk
+import train_utils  # Contains helper functions like compute_predicted_aligned_error_jax
 
 parser = argparse.ArgumentParser(
     description="Run template-based alphafold inference with a fine-tuned regression head",
@@ -59,35 +72,24 @@ parser.add_argument('--no_resample_msa', action='store_true', help='Dont randoml
 
 args = parser.parse_args()
 
-import os
 os.makedirs(args.output_dir, exist_ok=True)
 
-import sys
-from os.path import exists
-import itertools
-import numpy as np
-import pandas as pd
-import predict_utils
-import jax
-import jax.numpy as jnp
-import haiku as hk
-
-# --- UPDATED CLASS TO MATCH IMPROVED FINE-TUNING ---
-import train_utils # Contains helper functions like compute_predicted_aligned_error_jax
+# --- ENHANCED REGRESSOR TO MATCH IMPROVED FINE-TUNING ---
 
 class PaeBinderRegressor(hk.Module):
     """
-    Improved regressor that predicts pIC50 using PAE, peptide length, and MHC class.
-    This MUST match the architecture used in fine-tuning!
-    Features: proper normalization, dropout, and hidden layers.
+    Enhanced regressor that matches the improved training architecture.
+    Features: multi-layer network, attention mechanism, comprehensive features.
     """
-    def __init__(self, num_mhc_classes=2, dropout_rate=0.1, *args, **kwargs):
+    def __init__(self, num_mhc_classes=2, dropout_rate=0.15, hidden_dims=[32, 16], use_attention=True, *args, **kwargs):
         super().__init__(name="PaeBinderRegressor")
         self.num_mhc_classes = num_mhc_classes
         self.dropout_rate = dropout_rate
+        self.hidden_dims = hidden_dims
+        self.use_attention = use_attention
 
     def __call__(self, input_features, is_training=False):  # Default to inference mode
-        # Extract features from the input dictionary
+                # Extract features from the input dictionary
         mask1 = input_features['partner1_mask']
         mask2 = input_features['partner2_mask']
         mhc_class_1hot = input_features['mhc_class_1hot']
@@ -102,74 +104,154 @@ class PaeBinderRegressor(hk.Module):
                 input_features['predicted_aligned_error']['breaks'].ravel(),
             )['predicted_aligned_error']
         else:
-            # Direct PAE array (already computed)
+            # Legacy format - direct PAE array
             paes = input_features['predicted_aligned_error']
 
-        # Compute cross-interface PAE (improved calculation)
+        # Enhanced interface analysis with multiple PAE metrics (matching training)
+        interface_mask = mask1[..., None] * mask2[..., None, :]
+        interface_paes = paes * interface_mask
+        
+        # Basic cross-interface PAE
         paes12 = jnp.sum((paes * mask1[..., None]) * mask2[..., None, :])
         paes21 = jnp.sum((paes * mask2[..., None]) * mask1[..., None, :])
         total_pairs = jnp.sum(mask1) * jnp.sum(mask2)
+        avg_interface_pae = (paes12 + paes21) / (2 * total_pairs + 1e-8)
         
-        # Average PAE between partners, with better scaling
-        pae_feature_raw = (paes12 + paes21) / (2 * total_pairs + 1e-8)  # Add epsilon for numerical stability
+        # Additional PAE statistics for richer features - JAX-compatible version
+        # Use jnp.where instead of boolean indexing for JIT compilation
+        interface_paes_flat = interface_paes.ravel()
+        interface_mask_flat = interface_mask.ravel()
         
-        # Normalize peptide length (center around typical peptide lengths)
-        len_feature_raw = (peptide_len - 9.0) / 4.0  # Adjusted normalization
+        # JAX-safe way to compute statistics over masked values
+        masked_paes = jnp.where(interface_mask_flat > 0, interface_paes_flat, jnp.inf)
+        n_valid = jnp.sum(interface_mask_flat > 0)
         
-        # Ensure proper shape and apply feature normalization
-        pae_feature = pae_feature_raw.reshape(-1, 1)
-        len_feature = len_feature_raw.reshape(-1, 1)
+        # Compute min/max safely (use inf for invalid entries)
+        min_interface_pae = jnp.where(n_valid > 0, 
+                                    jnp.min(masked_paes), 
+                                    avg_interface_pae)
         
-        # Apply feature normalization (same as training)
-        pae_feature = (pae_feature - 8.0) / 4.0  # Typical PAE range is 4-16
-        len_feature = (len_feature - 0.0) / 1.0   # Already normalized above
+        # For max, use -inf for invalid entries  
+        masked_paes_max = jnp.where(interface_mask_flat > 0, interface_paes_flat, -jnp.inf)
+        max_interface_pae = jnp.where(n_valid > 0, 
+                                    jnp.max(masked_paes_max), 
+                                    avg_interface_pae)
         
-        # Combine features
-        features = jnp.concatenate([pae_feature, len_feature], axis=-1)
+        # For std, compute mean first then std manually
+        valid_mean = jnp.where(n_valid > 0, 
+                             jnp.sum(jnp.where(interface_mask_flat > 0, interface_paes_flat, 0.0)) / n_valid,
+                             avg_interface_pae)
+        valid_var = jnp.where(n_valid > 1,
+                            jnp.sum(jnp.where(interface_mask_flat > 0, 
+                                            (interface_paes_flat - valid_mean) ** 2, 0.0)) / n_valid,
+                            0.0)
+        std_interface_pae = jnp.sqrt(valid_var)
         
-        # Add additional features for better prediction
-        # Calculate interface confidence (complement of PAE)
-        interface_confidence = jnp.exp(-pae_feature_raw / 4.0).reshape(-1, 1)  # Convert PAE to confidence
-        features = jnp.concatenate([features, interface_confidence], axis=-1)
+        # Confidence features (complement of PAE)
+        interface_confidence = jnp.exp(-avg_interface_pae / 4.0)
+        min_confidence = jnp.exp(-max_interface_pae / 4.0)
         
-        # Improved neural network architecture (MUST match training)
-        num_features = features.shape[-1]
+        # Sequence-based features with better normalization
+        len_feature_raw = (peptide_len - 9.0) / 4.0  # Center around typical peptide lengths
+        len_squared = len_feature_raw ** 2  # Non-linear length effect
         
-        # Hidden layer with more capacity
-        hidden_dim = 16
-        w1_init = hk.initializers.VarianceScaling(scale=2.0, mode='fan_in', distribution='truncated_normal')
-        b1_init = hk.initializers.Constant(0.0)
+        # Structural quality features from pLDDT if available
+        if 'plddt' in input_features:
+            plddt = input_features['plddt']
+            partner1_plddt = jnp.sum(plddt * mask1) / (jnp.sum(mask1) + 1e-8)
+            partner2_plddt = jnp.sum(plddt * mask2) / (jnp.sum(mask2) + 1e-8)
+            avg_plddt = (partner1_plddt + partner2_plddt) / 2.0
+        else:
+            partner1_plddt = jnp.array(75.0)  # Default confidence
+            partner2_plddt = jnp.array(75.0)
+            avg_plddt = jnp.array(75.0)
         
-        w1 = hk.get_parameter("hidden_weights", shape=[num_features, hidden_dim], dtype=features.dtype, init=w1_init)
-        b1 = hk.get_parameter("hidden_biases", shape=[hidden_dim], dtype=features.dtype, init=b1_init)
+        # Normalize all features (same as training)
+        avg_interface_pae = (avg_interface_pae - 8.0) / 4.0  # PAE range 4-16
+        min_interface_pae = (min_interface_pae - 8.0) / 4.0
+        max_interface_pae = (max_interface_pae - 8.0) / 4.0
+        std_interface_pae = std_interface_pae / 4.0
+        len_feature_raw = len_feature_raw / 1.0  # Already normalized
+        partner1_plddt = (partner1_plddt - 70.0) / 20.0  # pLDDT range normalization
+        partner2_plddt = (partner2_plddt - 70.0) / 20.0
+        avg_plddt = (avg_plddt - 70.0) / 20.0
         
-        # Hidden layer with activation
-        hidden = features @ w1 + b1
-        hidden = jax.nn.tanh(hidden)  # Use tanh for better gradient flow
+        # Combine all features into a comprehensive feature vector (same as training)
+        all_features = jnp.array([
+            avg_interface_pae.ravel()[0],
+            min_interface_pae.ravel()[0],
+            max_interface_pae.ravel()[0], 
+            std_interface_pae.ravel()[0],
+            interface_confidence.ravel()[0],
+            min_confidence.ravel()[0],
+            len_feature_raw.ravel()[0],
+            len_squared.ravel()[0],
+            partner1_plddt.ravel()[0],
+            partner2_plddt.ravel()[0],
+            avg_plddt.ravel()[0]
+        ]).reshape(1, -1)
+
+        # Advanced multi-layer neural network (matching training architecture)
+        x = all_features
+        num_features = x.shape[-1]
         
-        # No dropout during inference (is_training=False by default)
-        if is_training and self.dropout_rate > 0:
-            key = hk.next_rng_key()
-            hidden = hk.dropout(key, self.dropout_rate, hidden)
+        # Apply feature attention if enabled
+        if self.use_attention:
+            attention_weights = hk.Linear(num_features, name='attention_weights')(x)
+            attention_weights = jax.nn.softmax(attention_weights, axis=-1)
+            x = x * attention_weights  # Weighted feature importance
         
-        # Output layer - separate models for each MHC class
-        w2_init = hk.initializers.VarianceScaling(scale=1.0, mode='fan_in', distribution='truncated_normal')
-        # Better initialization based on expected pIC50 values
-        b2_init = hk.initializers.Constant(jnp.array([6.0, 5.0]))  # Typical pIC50 values for Class I and II
+        # Multi-layer architecture with residual connections
+        for i, hidden_dim in enumerate(self.hidden_dims):
+            # Store input for potential residual connection
+            residual = x if x.shape[-1] == hidden_dim else None
+            
+            # Linear transformation with proper initialization
+            w_init = hk.initializers.VarianceScaling(scale=2.0, mode='fan_in', distribution='truncated_normal')
+            x = hk.Linear(hidden_dim, w_init=w_init, name=f'hidden_{i}')(x)
+            
+            # Layer normalization for stable training
+            x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True, name=f'ln_{i}')(x)
+            
+            # Advanced activation function (Swish/SiLU performs better than tanh)
+            x = jax.nn.swish(x)
+            
+            # Residual connection if dimensions match
+            if residual is not None:
+                x = x + 0.1 * residual  # Scaled residual for stability
+            
+            # No dropout during inference (is_training=False by default)
+            if is_training and self.dropout_rate > 0:
+                key = hk.next_rng_key()
+                x = hk.dropout(key, self.dropout_rate, x)
         
-        weights = hk.get_parameter("output_weights", shape=[hidden_dim, self.num_mhc_classes], dtype=features.dtype, init=w2_init)
-        biases = hk.get_parameter("output_biases", shape=[self.num_mhc_classes], dtype=features.dtype, init=b2_init)
+        # MHC class-specific output heads with better initialization
+        class_predictions = []
+        for mhc_class in range(self.num_mhc_classes):
+            # Separate head for each MHC class
+            class_head = hk.Linear(1, name=f'output_class_{mhc_class}')
+            class_pred = class_head(x)
+            class_predictions.append(class_pred)
         
-        # Calculate prediction for all classes
-        prediction_per_class = hidden @ weights + biases
+        # Combine class-specific predictions
+        prediction_per_class = jnp.concatenate(class_predictions, axis=-1)
         
-        # Use the one-hot encoding to select the prediction from the correct MHC class
+        # Apply class-specific bias based on typical pIC50 values
+        class_bias = jnp.array([6.0, 5.0])  # Class I typically higher than Class II
+        prediction_per_class = prediction_per_class + class_bias
+        
+        # Select prediction based on MHC class
         predicted_pic50 = jnp.sum(prediction_per_class * mhc_class_1hot, axis=-1, keepdims=True)
         
-        return predicted_pic50, features
+        return predicted_pic50, all_features
 
 def binder_regression_fn(input_features, is_training=False):
-    model = PaeBinderRegressor(num_mhc_classes=2, dropout_rate=0.1)(input_features, is_training=is_training)
+    model = PaeBinderRegressor(
+        num_mhc_classes=2, 
+        dropout_rate=0.15,
+        hidden_dims=[32, 16], 
+        use_attention=True
+    )(input_features, is_training=is_training)
     return model
 
 binder_regressor = hk.transform(binder_regression_fn, apply_rng=True)

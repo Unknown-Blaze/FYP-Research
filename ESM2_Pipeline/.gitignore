@@ -1,0 +1,7 @@
+# Ignore model weights, outputs, and logs
+*.pt
+*.pth
+*.log
+outputs/
+checkpoints/
+__pycache__/
