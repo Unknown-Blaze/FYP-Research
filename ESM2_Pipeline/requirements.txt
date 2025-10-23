@@ -1,4 +1,9 @@
 torch
 transformers
 pandas
-graphviz
+pyyaml
+pydantic
+scikit-learn
+scipy
+tensorboard
+joblib

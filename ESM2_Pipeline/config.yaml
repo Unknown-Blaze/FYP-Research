@@ -1,0 +1,38 @@
+# ----------------------------------
+# Experiment Configuration File (v6)
+# ----------------------------------
+
+# --- Core Paths ---
+data_file: "iedb_dataset.csv"
+output_dir: "./checkpoints_2"
+
+# --- Model ---
+model_name: "facebook/esm2_t33_650M_UR50D"
+max_length: 512
+
+# --- Data Columns ---
+mhc_col: "mhc_sequence"
+pep_col: "peptide"
+label_col: "binding_affinity_nM"
+
+# --- Data Preprocessing ---
+convert_to_pic50: true
+normalize: true
+
+# --- Data Splitting & Reproducibility ---
+seed: 42
+test_size: 0.1
+valid_size: 0.1
+
+# --- Training Hyperparameters ---
+epochs: 50
+batch_size: 32
+accum_steps: 1
+lr: 1e-5
+scheduler_patience: 3 
+clip_norm: 1.0
+early_stopping_patience: 10
+
+# --- Hardware & Performance ---
+use_amp: true
+num_workers: 12
