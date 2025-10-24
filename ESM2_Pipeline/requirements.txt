@@ -7,3 +7,5 @@ scikit-learn
 scipy
 tensorboard
 joblib
+einops
+esm2

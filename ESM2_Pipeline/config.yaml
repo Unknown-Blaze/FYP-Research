@@ -4,10 +4,11 @@
 
 # --- Core Paths ---
 data_file: "iedb_dataset.csv"
-output_dir: "./checkpoints_2"
+output_dir: "./checkpoints_4_esm_cba"
 
 # --- Model ---
-model_name: "facebook/esm2_t33_650M_UR50D"
+model_name: "smares/ESMCBA"
+tokenizer_name: "facebook/esm2_t33_650M_UR50D"
 max_length: 512
 
 # --- Data Columns ---

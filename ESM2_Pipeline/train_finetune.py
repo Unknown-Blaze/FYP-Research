@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast
-from transformers import EsmTokenizer, EsmModel, PreTrainedTokenizer
+from transformers import AutoTokenizer, AutoModel, PreTrainedTokenizer
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
@@ -50,6 +50,7 @@ class AppConfig(BaseModel):
 
     # --- Model ---
     model_name: str
+    tokenizer_name: str
     max_length: conint(gt=0) = 512
 
     # --- Data Columns ---
@@ -123,7 +124,10 @@ class ESM2FineTuneModel(nn.Module):
     def __init__(self, esm_model_name: str, hidden_dim: int = 512, dropout: float = 0.2) -> None:
         super().__init__()
         logging.info(f"Loading ESM-2 model: {esm_model_name}...")
-        self.esm_model: nn.Module = EsmModel.from_pretrained(esm_model_name)
+        self.esm_model: nn.Module = AutoModel.from_pretrained(
+            esm_model_name,
+            trust_remote_code=True  # <-- This is the crucial addition
+        )
         
         esm_dim: int = self.esm_model.config.hidden_size
         
@@ -374,9 +378,9 @@ def run_training(config: AppConfig, device: torch.device) -> None:
     
     train_df, valid_df, test_df, label_scaler = prepare_data(config)
 
-    logging.info(f"Loading tokenizer: {config.model_name}")
+    logging.info(f"Loading tokenizer: {config.tokenizer_name}")
     try:
-        tokenizer: PreTrainedTokenizer = EsmTokenizer.from_pretrained(config.model_name)
+        tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
     except Exception as e:
         logging.fatal(f"Could not load tokenizer. Error: {e}")
         sys.exit(1)
@@ -595,9 +599,9 @@ def run_evaluation(config: AppConfig, device: torch.device) -> None:
     logging.info("Loading and processing test data...")
     _, _, test_df, _ = prepare_data(config)
 
-    logging.info(f"Loading tokenizer: {config.model_name}")
+    logging.info(f"Loading tokenizer: {config.tokenizer_name}")
     try:
-        tokenizer: PreTrainedTokenizer = EsmTokenizer.from_pretrained(config.model_name)
+        tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
     except Exception as e:
         logging.fatal(f"Could not load tokenizer. Error: {e}")
         sys.exit(1)
