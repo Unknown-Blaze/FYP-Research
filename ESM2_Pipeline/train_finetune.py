@@ -16,7 +16,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast
-from transformers import AutoTokenizer, AutoModel, PreTrainedTokenizer
+from transformers import AutoTokenizer, AutoConfig, PreTrainedTokenizer, EsmModel
+from huggingface_hub import hf_hub_download
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
@@ -31,6 +32,8 @@ import logging
 import joblib
 import yaml
 from functools import partial
+
+# import esm
 
 # 🆕 --- Pydantic & Type Hinting Imports ---
 from typing import List, Dict, Tuple, Optional, Any, Union
@@ -121,16 +124,85 @@ def set_seed(seed_value: int) -> None:
 # ===========================================================================
 
 class ESM2FineTuneModel(nn.Module):
-    def __init__(self, esm_model_name: str, hidden_dim: int = 512, dropout: float = 0.2) -> None:
+    def __init__(self, esm_model_name: str, tokenizer_name: str, hidden_dim: int = 512, dropout: float = 0.2) -> None:
         super().__init__()
-        logging.info(f"Loading ESM-2 model: {esm_model_name}...")
-        self.esm_model: nn.Module = AutoModel.from_pretrained(
-            esm_model_name,
-            trust_remote_code=True  # <-- This is the crucial addition
-        )
+        logging.info(f"Loading model: {esm_model_name}...")
+        logging.info(f"Using model config from: {tokenizer_name}")
+
+        # 1. Load the working config from the *tokenizer*
+        config = AutoConfig.from_pretrained(tokenizer_name)
+
+        # 2. Create the model architecture from scratch
+        self.esm_model = EsmModel(config)
+
+        # --- START NEW FIX ---
+
+        # 3. Define the LOCAL path to the weights file
+        logging.info(f"Downloading weights from: {esm_model_name}")
+        correct_filename = "models/A0201_epitope_v0.1/model.pth" # <-- Use the full path
+        logging.info(f"Attempting to download file: {correct_filename}")
+        try:
+            weights_path = hf_hub_download(
+                repo_id=esm_model_name,
+                filename=correct_filename  # <-- Corrected filename/path
+            )
+        except Exception as e:
+            logging.fatal(f"Could not download weights file {correct_filename} for {esm_model_name}. Error: {e}")
+            sys.exit(1)
+
+        # 4. Load the weights (this part is the same as before)
+        logging.info("Loading downloaded weights into model...")
+        try:
+            full_state_dict = torch.load(weights_path, map_location="cpu")
+        except Exception as e:
+            logging.fatal(f"Failed to load checkpoint file {weights_path}. Error: {e}")
+            sys.exit(1)
+
+        # 5. Filter and rename keys for the base EsmModel
+        esm_state_dict = {}
+        prefix_to_strip = "base_model."
+        prefix_len = len(prefix_to_strip)
         
+        logging.info(f"Extracting weights with prefix '{prefix_to_strip}'...")
+        found_keys = False
+        for key, value in full_state_dict.items():
+            if key.startswith(prefix_to_strip):
+                new_key = key[prefix_len:] # Remove the prefix
+                esm_state_dict[new_key] = value
+                found_keys = True
+
+        if not found_keys:
+            logging.fatal(f"No keys matching prefix '{prefix_to_strip}' found in {weights_path}.")
+            # --- DEBUGGING: Print keys if prefix fails ---
+            logging.info("Available keys in checkpoint:")
+            for key in full_state_dict.keys():
+                 logging.info(f"  - {key}")
+            # --- END DEBUGGING ---
+            sys.exit(1)
+        
+        # 6. Load the filtered state_dict into our EsmModel
+        logging.info("Loading extracted weights into EsmModel...")
+        try:
+            # Set strict=False initially in case the checkpoint is missing minor things
+            # like rotary embeddings inv_freq, which might be recalculated
+            incompatible_keys = self.esm_model.load_state_dict(esm_state_dict, strict=False) 
+            
+            # Log any remaining issues (should be minimal if config matches)
+            if incompatible_keys.missing_keys:
+                 logging.warning(f"Missing keys when loading weights: {incompatible_keys.missing_keys}")
+            if incompatible_keys.unexpected_keys:
+                 logging.warning(f"Unexpected keys when loading weights: {incompatible_keys.unexpected_keys}")
+                 
+            logging.info("✓ Weights loaded successfully (or with minor incompatibilities).")
+            
+        except Exception as e:
+            logging.fatal(f"Failed to load extracted state_dict. Error: {e}")
+            sys.exit(1)
+
+        # --- END NEW FIX ---
+
         esm_dim: int = self.esm_model.config.hidden_size
-        
+
         self.regression_head = nn.Sequential(
             nn.Linear(esm_dim * 2, hidden_dim),
             nn.ReLU(),
@@ -397,7 +469,11 @@ def run_training(config: AppConfig, device: torch.device) -> None:
     valid_loader = DataLoader(valid_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True, collate_fn=collate_wrapper)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True, collate_fn=collate_wrapper)
 
-    model: nn.Module = ESM2FineTuneModel(esm_model_name=config.model_name).to(device)
+    model: nn.Module = ESM2FineTuneModel(
+        esm_model_name=config.model_name,
+        tokenizer_name=config.tokenizer_name  # <-- Pass in the tokenizer name
+    ).to(device)
+    
     criterion: nn.Module = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
     
@@ -610,7 +686,11 @@ def run_evaluation(config: AppConfig, device: torch.device) -> None:
     collate_wrapper = partial(collate_fn, pad_token_id=tokenizer.pad_token_id)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, collate_fn=collate_wrapper)
 
-    model: nn.Module = ESM2FineTuneModel(esm_model_name=config.model_name).to(device)
+    model: nn.Module = ESM2FineTuneModel(
+        esm_model_name=config.model_name,
+        tokenizer_name=config.tokenizer_name  # <-- Pass in the tokenizer name
+    ).to(device)
+
     try:
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         logging.info(f"Loaded model from {best_model_path}")

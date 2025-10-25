@@ -26,10 +26,10 @@ test_size: 0.1
 valid_size: 0.1
 
 # --- Training Hyperparameters ---
-epochs: 50
+epochs: 100
 batch_size: 32
 accum_steps: 1
-lr: 1e-5
+lr: 1e-6
 scheduler_patience: 3 
 clip_norm: 1.0
 early_stopping_patience: 10
