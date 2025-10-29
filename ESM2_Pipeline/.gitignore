@@ -3,5 +3,5 @@
 *.pth
 *.log
 outputs/
-checkpoints/
+checkpoints*/
 __pycache__/

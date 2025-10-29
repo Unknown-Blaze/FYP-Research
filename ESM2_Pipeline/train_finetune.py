@@ -1,18 +1,21 @@
 """
-ESM-2 Fine-Tuning Script (v6 - Pydantic Validation)
+ESM-2 Fine-Tuning Script with Advanced Cross-Attention (v7)
 
-CHANGE LOG (from v5):
-    - 🛡️ Added Pydantic validation for the config.yaml file.
-    - 🆕 Defined an `AppConfig(BaseModel)` to parse and type-check all settings.
-    - 🆕 `load_config` now uses `AppConfig` and catches `ValidationError`.
-    - ⚙️ Moved `scheduler_patience` from hardcoded to the config file.
-    - 🆕 New dependency: `pydantic`
+IMPROVEMENTS OVER v6:
+    - 🔥 Multi-layer bidirectional cross-attention with residual connections
+    - 🔥 Gated fusion mechanism for better information integration
+    - 🔥 Co-attention mechanism for symmetrical interaction modeling
+    - 🔥 Interaction-aware pooling (attention-weighted instead of mean)
+    - 🔥 Learnable query projections for better MHC-peptide interaction modeling
+    - 🔥 Layer normalization and dropout at strategic points
+    - 🔥 Optional frozen ESM encoder for stable feature extraction
 """
 import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast
@@ -32,14 +35,11 @@ import logging
 import joblib
 import yaml
 from functools import partial
-
-# import esm
-
-# 🆕 --- Pydantic & Type Hinting Imports ---
 from typing import List, Dict, Tuple, Optional, Any, Union
 from pydantic import BaseModel, ValidationError, FilePath, DirectoryPath, conint, confloat
 
 warnings.filterwarnings('ignore')
+
 
 # ===========================================================================
 # 0. CONFIGURATION VALIDATION (PYDANTIC)
@@ -49,12 +49,18 @@ class AppConfig(BaseModel):
     """Pydantic model to validate the config.yaml file."""
     # --- Core Paths ---
     data_file: FilePath
-    output_dir: str # Can't validate as DirectoryPath yet, as it might not exist
+    output_dir: str
 
     # --- Model ---
     model_name: str
     tokenizer_name: str
     max_length: conint(gt=0) = 512
+    
+    # --- Cross-Attention Config ---
+    freeze_esm: bool = False  # NEW: Option to freeze ESM encoder
+    num_ca_layers: conint(gt=0) = 2  # NEW: Number of cross-attention layers
+    num_attention_heads: conint(gt=0) = 8
+    ca_dropout: confloat(ge=0, lt=1) = 0.1
 
     # --- Data Columns ---
     mhc_col: str
@@ -75,13 +81,14 @@ class AppConfig(BaseModel):
     batch_size: conint(gt=0)
     accum_steps: conint(gt=0)
     lr: confloat(gt=0)
-    scheduler_patience: conint(ge=0) # 🆕
+    scheduler_patience: conint(ge=0)
     clip_norm: confloat(gt=0)
     early_stopping_patience: conint(gt=0)
 
     # --- Hardware & Performance ---
     use_amp: bool
     num_workers: conint(ge=0)
+
 
 # ===========================================================================
 # 1. LOGGING SETUP
@@ -104,6 +111,7 @@ def setup_logging(output_dir: str) -> None:
     console_handler.setFormatter(log_formatter)
     root_logger.addHandler(console_handler)
 
+
 # ===========================================================================
 # 2. REPRODUCIBILITY
 # ===========================================================================
@@ -119,132 +127,318 @@ def set_seed(seed_value: int) -> None:
         torch.backends.cudnn.benchmark = False
     logging.info(f"Set random seed to {seed_value}")
 
+
 # ===========================================================================
-# 3. MODEL DEFINITION
+# 3. ADVANCED CROSS-ATTENTION MODEL
 # ===========================================================================
 
-class ESM2FineTuneModel(nn.Module):
-    def __init__(self, esm_model_name: str, tokenizer_name: str, hidden_dim: int = 512, dropout: float = 0.2) -> None:
+class GatedFusion(nn.Module):
+    """
+    Gated fusion mechanism to dynamically weight original and cross-attended features.
+    This allows the model to learn when to trust cross-attention vs original features.
+    """
+    def __init__(self, embed_dim: int):
         super().__init__()
-        logging.info(f"Loading model: {esm_model_name}...")
-        logging.info(f"Using model config from: {tokenizer_name}")
-
-        # 1. Load the working config from the *tokenizer*
-        config = AutoConfig.from_pretrained(tokenizer_name)
-
-        # 2. Create the model architecture from scratch
-        self.esm_model = EsmModel(config)
-
-        # --- START NEW FIX ---
-
-        # 3. Define the LOCAL path to the weights file
-        logging.info(f"Downloading weights from: {esm_model_name}")
-        correct_filename = "models/A0201_epitope_v0.1/model.pth" # <-- Use the full path
-        logging.info(f"Attempting to download file: {correct_filename}")
-        try:
-            weights_path = hf_hub_download(
-                repo_id=esm_model_name,
-                filename=correct_filename  # <-- Corrected filename/path
-            )
-        except Exception as e:
-            logging.fatal(f"Could not download weights file {correct_filename} for {esm_model_name}. Error: {e}")
-            sys.exit(1)
-
-        # 4. Load the weights (this part is the same as before)
-        logging.info("Loading downloaded weights into model...")
-        try:
-            full_state_dict = torch.load(weights_path, map_location="cpu")
-        except Exception as e:
-            logging.fatal(f"Failed to load checkpoint file {weights_path}. Error: {e}")
-            sys.exit(1)
-
-        # 5. Filter and rename keys for the base EsmModel
-        esm_state_dict = {}
-        prefix_to_strip = "base_model."
-        prefix_len = len(prefix_to_strip)
-        
-        logging.info(f"Extracting weights with prefix '{prefix_to_strip}'...")
-        found_keys = False
-        for key, value in full_state_dict.items():
-            if key.startswith(prefix_to_strip):
-                new_key = key[prefix_len:] # Remove the prefix
-                esm_state_dict[new_key] = value
-                found_keys = True
-
-        if not found_keys:
-            logging.fatal(f"No keys matching prefix '{prefix_to_strip}' found in {weights_path}.")
-            # --- DEBUGGING: Print keys if prefix fails ---
-            logging.info("Available keys in checkpoint:")
-            for key in full_state_dict.keys():
-                 logging.info(f"  - {key}")
-            # --- END DEBUGGING ---
-            sys.exit(1)
-        
-        # 6. Load the filtered state_dict into our EsmModel
-        logging.info("Loading extracted weights into EsmModel...")
-        try:
-            # Set strict=False initially in case the checkpoint is missing minor things
-            # like rotary embeddings inv_freq, which might be recalculated
-            incompatible_keys = self.esm_model.load_state_dict(esm_state_dict, strict=False) 
-            
-            # Log any remaining issues (should be minimal if config matches)
-            if incompatible_keys.missing_keys:
-                 logging.warning(f"Missing keys when loading weights: {incompatible_keys.missing_keys}")
-            if incompatible_keys.unexpected_keys:
-                 logging.warning(f"Unexpected keys when loading weights: {incompatible_keys.unexpected_keys}")
-                 
-            logging.info("✓ Weights loaded successfully (or with minor incompatibilities).")
-            
-        except Exception as e:
-            logging.fatal(f"Failed to load extracted state_dict. Error: {e}")
-            sys.exit(1)
-
-        # --- END NEW FIX ---
-
-        esm_dim: int = self.esm_model.config.hidden_size
-
-        self.regression_head = nn.Sequential(
-            nn.Linear(esm_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 4, 1)
+        self.gate = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Sigmoid()
         )
-    
-    def pool_embeddings(self, outputs: Any, attention_mask: torch.Tensor) -> torch.Tensor:
-        embeddings: torch.Tensor = outputs.last_hidden_state
-        mask = attention_mask.unsqueeze(-1)
-        pooled = (embeddings * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+        
+    def forward(self, original: torch.Tensor, cross_attended: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            original: [B, S, D] - original embeddings
+            cross_attended: [B, S, D] - cross-attended embeddings
+        Returns:
+            fused: [B, S, D] - gated fusion of both
+        """
+        combined = torch.cat([original, cross_attended], dim=-1)  # [B, S, 2D]
+        gate = self.gate(combined)  # [B, S, D]
+        return gate * cross_attended + (1 - gate) * original
+
+
+class CoAttentionLayer(nn.Module):
+    """
+    Co-attention layer that models bidirectional interactions between MHC and peptide.
+    This is more sophisticated than simple cross-attention as it allows both sequences
+    to mutually influence each other in a single forward pass.
+    """
+    def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        
+        # Separate attention mechanisms for each direction
+        self.mhc_to_pep_attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.pep_to_mhc_attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Gated fusion for both directions
+        self.mhc_fusion = GatedFusion(embed_dim)
+        self.pep_fusion = GatedFusion(embed_dim)
+        
+        # Layer normalization
+        self.mhc_norm = nn.LayerNorm(embed_dim)
+        self.pep_norm = nn.LayerNorm(embed_dim)
+        
+        # Feed-forward networks
+        self.mhc_ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.pep_ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(
+        self, 
+        mhc_hidden: torch.Tensor, 
+        pep_hidden: torch.Tensor,
+        mhc_mask: torch.Tensor,
+        pep_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            mhc_hidden: [B, Lm, D]
+            pep_hidden: [B, Lp, D]
+            mhc_mask: [B, Lm] - True for valid positions
+            pep_mask: [B, Lp] - True for valid positions
+        Returns:
+            mhc_out: [B, Lm, D] - enhanced MHC features
+            pep_out: [B, Lp, D] - enhanced peptide features
+        """
+        # MHC attends to peptide
+        mhc_attended, _ = self.mhc_to_pep_attn(
+            query=mhc_hidden,
+            key=pep_hidden,
+            value=pep_hidden,
+            key_padding_mask=~pep_mask
+        )
+        mhc_fused = self.mhc_fusion(mhc_hidden, mhc_attended)
+        mhc_normed = self.mhc_norm(mhc_fused)
+        
+        # Peptide attends to MHC
+        pep_attended, _ = self.pep_to_mhc_attn(
+            query=pep_hidden,
+            key=mhc_hidden,
+            value=mhc_hidden,
+            key_padding_mask=~mhc_mask
+        )
+        pep_fused = self.pep_fusion(pep_hidden, pep_attended)
+        pep_normed = self.pep_norm(pep_fused)
+        
+        # Feed-forward with residual
+        mhc_out = mhc_normed + self.mhc_ffn(mhc_normed)
+        pep_out = pep_normed + self.pep_ffn(pep_normed)
+        
+        return mhc_out, pep_out
+
+
+class AttentionPooling(nn.Module):
+    """
+    Learnable attention-based pooling that focuses on important positions.
+    This is superior to mean pooling as it learns which positions are most relevant.
+    """
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Tanh(),
+            nn.Linear(embed_dim // 2, 1)
+        )
+        
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, S, D]
+            attention_mask: [B, S] - True for valid positions
+        Returns:
+            pooled: [B, D]
+        """
+        # Compute attention scores
+        attention_scores = self.attention(hidden_states).squeeze(-1)  # [B, S]
+        
+        # Mask invalid positions
+        attention_scores = attention_scores.masked_fill(~attention_mask, float('-inf'))
+        
+        # Softmax to get attention weights
+        attention_weights = F.softmax(attention_scores, dim=1).unsqueeze(-1)  # [B, S, 1]
+        
+        # Weighted sum
+        pooled = (hidden_states * attention_weights).sum(dim=1)  # [B, D]
+        
         return pooled
 
-    def forward(self, mhc_batch: Dict[str, torch.Tensor], pep_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+
+class InteractionModule(nn.Module):
+    """
+    Models explicit pairwise interactions between MHC and peptide features.
+    Uses element-wise operations to capture interaction patterns.
+    """
+    def __init__(self, embed_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.Linear(embed_dim * 3, embed_dim),  # 3x because we use concat, product, and difference
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, mhc_pooled: torch.Tensor, pep_pooled: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            mhc_pooled: [B, D]
+            pep_pooled: [B, D]
+        Returns:
+            interaction: [B, D]
+        """
+        # Concatenation (captures co-occurrence)
+        concat = torch.cat([mhc_pooled, pep_pooled], dim=-1)
+        
+        # Element-wise product (captures multiplicative interactions)
+        product = mhc_pooled * pep_pooled
+        
+        # Element-wise difference (captures contrast/complementarity)
+        difference = torch.abs(mhc_pooled - pep_pooled)
+        
+        # Combine all interaction types
+        combined = torch.cat([concat, product, difference], dim=-1)
+        
+        return self.projection(combined)
+
+
+class ESM2FineTuneModel(nn.Module):
+    """
+    Advanced ESM-2 fine-tuning model with multi-layer co-attention,
+    gated fusion, interaction modeling, and attention pooling.
+    """
+    def __init__(
+        self, 
+        esm_model_name: str, 
+        tokenizer_name: str, 
+        num_ca_layers: int = 2,
+        num_heads: int = 8,
+        hidden_dim: int = 512, 
+        dropout: float = 0.2,
+        freeze_esm: bool = False
+    ):
+        super().__init__()
+        logging.info(f"Loading model: {esm_model_name}...")
+        logging.info(f"Configuration: {num_ca_layers} co-attention layers, {num_heads} heads")
+        logging.info(f"ESM encoder frozen: {freeze_esm}")
+        
+        # Load ESM model
+        self.esm_model = EsmModel.from_pretrained(esm_model_name)
+        embed_dim = self.esm_model.config.hidden_size
+        
+        # Optionally freeze ESM encoder
+        if freeze_esm:
+            for param in self.esm_model.parameters():
+                param.requires_grad = False
+            logging.info("✓ ESM encoder frozen - only training cross-attention layers")
+        
+        # Multi-layer co-attention stack
+        self.co_attention_layers = nn.ModuleList([
+            CoAttentionLayer(embed_dim, num_heads, dropout)
+            for _ in range(num_ca_layers)
+        ])
+        
+        # Attention-based pooling (better than mean pooling)
+        self.mhc_pooling = AttentionPooling(embed_dim)
+        self.pep_pooling = AttentionPooling(embed_dim)
+        
+        # Interaction module
+        self.interaction_module = InteractionModule(embed_dim, dropout)
+        
+        # Final regression head
+        # Input: 4 * embed_dim (original MHC, original pep, CA MHC, CA pep) + embed_dim (interaction)
+        total_dim = embed_dim * 5
+        self.regression_head = nn.Sequential(
+            nn.Linear(total_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(
+        self, 
+        mhc_batch: Dict[str, torch.Tensor], 
+        pep_batch: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
         device = next(self.esm_model.parameters()).device
+        mhc_batch = {k: v.to(device) for k, v in mhc_batch.items()}
+        pep_batch = {k: v.to(device) for k, v in pep_batch.items()}
         
-        mhc_batch_gpu = {k: v.to(device) for k, v in mhc_batch.items()}
-        pep_batch_gpu = {k: v.to(device) for k, v in pep_batch.items()}
+        # Extract ESM embeddings
+        with torch.set_grad_enabled(self.training and any(p.requires_grad for p in self.esm_model.parameters())):
+            mhc_hidden = self.esm_model(**mhc_batch).last_hidden_state  # [B, Lm, D]
+            pep_hidden = self.esm_model(**pep_batch).last_hidden_state  # [B, Lp, D]
         
-        mhc_outputs = self.esm_model(**mhc_batch_gpu)
-        pep_outputs = self.esm_model(**pep_batch_gpu)
+        mhc_mask = mhc_batch['attention_mask'].bool()
+        pep_mask = pep_batch['attention_mask'].bool()
         
-        mhc_emb = self.pool_embeddings(mhc_outputs, mhc_batch_gpu['attention_mask'])
-        pep_emb = self.pool_embeddings(pep_outputs, pep_batch_gpu['attention_mask'])
+        # Store original embeddings for residual connection
+        mhc_original = mhc_hidden
+        pep_original = pep_hidden
         
-        combined = torch.cat([mhc_emb, pep_emb], dim=1)
+        # Apply multi-layer co-attention
+        for co_attn_layer in self.co_attention_layers:
+            mhc_hidden, pep_hidden = co_attn_layer(
+                mhc_hidden, pep_hidden, mhc_mask, pep_mask
+            )
+        
+        # Attention-based pooling (both original and cross-attended)
+        mhc_orig_pooled = self.mhc_pooling(mhc_original, mhc_mask)  # [B, D]
+        pep_orig_pooled = self.pep_pooling(pep_original, pep_mask)  # [B, D]
+        mhc_ca_pooled = self.mhc_pooling(mhc_hidden, mhc_mask)      # [B, D]
+        pep_ca_pooled = self.pep_pooling(pep_hidden, pep_mask)      # [B, D]
+        
+        # Compute explicit interactions
+        interaction_features = self.interaction_module(mhc_ca_pooled, pep_ca_pooled)  # [B, D]
+        
+        # Concatenate all features
+        combined = torch.cat([
+            mhc_orig_pooled,    # Original MHC features
+            pep_orig_pooled,    # Original peptide features
+            mhc_ca_pooled,      # Cross-attended MHC features
+            pep_ca_pooled,      # Cross-attended peptide features
+            interaction_features # Explicit interaction features
+        ], dim=1)  # [B, 5D]
+        
+        # Final prediction
         return self.regression_head(combined)
+
 
 # ===========================================================================
 # 4. DATASET & COLLATE FUNCTION
 # ===========================================================================
 
 class MHCSequenceDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, tokenizer: PreTrainedTokenizer, 
-                 mhc_col: str, peptide_col: str, ic50_col: str, max_length: int) -> None:
-        
+    def __init__(
+        self, 
+        df: pd.DataFrame, 
+        tokenizer: PreTrainedTokenizer, 
+        mhc_col: str, 
+        peptide_col: str, 
+        ic50_col: str, 
+        max_length: int
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -288,7 +482,11 @@ class MHCSequenceDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.float32)
         }
 
-def collate_fn(batch_list: List[Dict[str, Any]], pad_token_id: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor]:
+
+def collate_fn(
+    batch_list: List[Dict[str, Any]], 
+    pad_token_id: int
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor]:
     labels = torch.stack([item['label'] for item in batch_list])
     
     mhc_batches: Dict[str, torch.Tensor] = {}
@@ -314,13 +512,18 @@ def collate_fn(batch_list: List[Dict[str, Any]], pad_token_id: int) -> Tuple[Dic
     
     return mhc_batches, pep_batches, labels
 
+
 # ===========================================================================
 # 5. EVALUATION
 # ===========================================================================
 
-def evaluate(model: nn.Module, data_loader: DataLoader, criterion: nn.Module, 
-             device: torch.device, scaler: Optional[MinMaxScaler] = None
-             ) -> Tuple[float, float, float, float, float, np.ndarray, np.ndarray]:
+def evaluate(
+    model: nn.Module, 
+    data_loader: DataLoader, 
+    criterion: nn.Module, 
+    device: torch.device, 
+    scaler: Optional[MinMaxScaler] = None
+) -> Tuple[float, float, float, float, float, np.ndarray, np.ndarray]:
     
     model.eval()
     total_loss: float = 0.0
@@ -359,8 +562,9 @@ def evaluate(model: nn.Module, data_loader: DataLoader, criterion: nn.Module,
     return avg_loss, float(rmse), float(r2), float(pcc), float(scc), \
            all_preds_orig.flatten(), all_targets_orig.flatten()
 
+
 # ===========================================================================
-# 6. DATA PREPARATION (Helper Function)
+# 6. DATA PREPARATION
 # ===========================================================================
 
 def prepare_data(config: AppConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[MinMaxScaler]]:
@@ -380,7 +584,6 @@ def prepare_data(config: AppConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Data
             all_df, test_size=config.test_size, random_state=config.seed
         )
         
-        # Scale validation size correctly
         if (1.0 - config.test_size) == 0:
              logging.fatal("test_size cannot be 1.0. Set to a value < 1.")
              sys.exit(1)
@@ -434,6 +637,7 @@ def prepare_data(config: AppConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Data
             
     return train_df, valid_df, test_df, label_scaler
 
+
 # ===========================================================================
 # 7. TRAINING FUNCTION
 # ===========================================================================
@@ -471,13 +675,22 @@ def run_training(config: AppConfig, device: torch.device) -> None:
 
     model: nn.Module = ESM2FineTuneModel(
         esm_model_name=config.model_name,
-        tokenizer_name=config.tokenizer_name  # <-- Pass in the tokenizer name
+        tokenizer_name=config.tokenizer_name,
+        num_ca_layers=config.num_ca_layers,
+        num_heads=config.num_attention_heads,
+        dropout=config.ca_dropout,
+        freeze_esm=config.freeze_esm
     ).to(device)
     
     criterion: nn.Module = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
     
-    # 🆕 --- Scheduler uses config ---
+    # Only optimize parameters that require gradients
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=0.01)
+    
+    logging.info(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logging.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+    
     scheduler = ReduceLROnPlateau(
         optimizer, 'min', 
         patience=config.scheduler_patience, 
@@ -509,7 +722,7 @@ def run_training(config: AppConfig, device: torch.device) -> None:
 
     effective_batch_size = config.batch_size * config.accum_steps
     logging.info("\n" + "=" * 70)
-    logging.info("Starting training...")
+    logging.info("Starting training with ADVANCED CROSS-ATTENTION...")
     logging.info(f"  Config: {config.model_dump_json(indent=2)}")
     logging.info(f"  Effective Batch Size: {effective_batch_size}")
     logging.info(f"  AMP: {config.use_amp}")
@@ -535,7 +748,7 @@ def run_training(config: AppConfig, device: torch.device) -> None:
 
             if (i + 1) % config.accum_steps == 0 or (i + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -549,6 +762,7 @@ def run_training(config: AppConfig, device: torch.device) -> None:
         logging.info(f"\nEpoch {epoch+1}/{config.epochs}")
         logging.info(f"  Train Loss: {avg_train_loss:.4f} (scaled)")
         logging.info(f"  Valid Loss: {valid_loss:.4f} (scaled), Valid RMSE: {valid_rmse:.4f}, Valid R²: {valid_r2:.4f}")
+        logging.info(f"  Valid PCC: {valid_pcc:.4f}, Valid SCC: {valid_scc:.4f}")
         
         writer.add_scalar('Loss/train', avg_train_loss, epoch)
         writer.add_scalar('Loss/valid', valid_loss, epoch)
@@ -644,6 +858,7 @@ def run_training(config: AppConfig, device: torch.device) -> None:
     writer.close()
     logging.info("\nTraining complete. Run finished.")
 
+
 # ===========================================================================
 # 8. EVALUATION-ONLY FUNCTION
 # ===========================================================================
@@ -688,7 +903,11 @@ def run_evaluation(config: AppConfig, device: torch.device) -> None:
 
     model: nn.Module = ESM2FineTuneModel(
         esm_model_name=config.model_name,
-        tokenizer_name=config.tokenizer_name  # <-- Pass in the tokenizer name
+        tokenizer_name=config.tokenizer_name,
+        num_ca_layers=config.num_ca_layers,
+        num_heads=config.num_attention_heads,
+        dropout=config.ca_dropout,
+        freeze_esm=config.freeze_esm
     ).to(device)
 
     try:
@@ -719,6 +938,7 @@ def run_evaluation(config: AppConfig, device: torch.device) -> None:
     
     logging.info("Evaluation complete. Run finished.")
 
+
 # ===========================================================================
 # 9. MAIN EXECUTION
 # ===========================================================================
@@ -729,10 +949,7 @@ def load_config(config_path: str) -> AppConfig:
         with open(config_path, 'r') as f:
             config_data: Dict[str, Any] = yaml.safe_load(f)
         
-        # 🛡️ --- Validate and parse the config ---
         config = AppConfig(**config_data)
-        
-        # Create output directory *after* validation
         os.makedirs(config.output_dir, exist_ok=True)
         return config
         
@@ -740,7 +957,6 @@ def load_config(config_path: str) -> AppConfig:
         print(f"FATAL: Config file not found at: {config_path}")
         sys.exit(1)
     except ValidationError as e:
-        # 🛡️ --- Clean Pydantic error ---
         print(f"FATAL: Configuration error in '{config_path}':\n")
         print(e)
         sys.exit(1)
@@ -748,8 +964,9 @@ def load_config(config_path: str) -> AppConfig:
         print(f"FATAL: Error parsing config file: {e}")
         sys.exit(1)
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ESM-2 Fine-tuning (v6 - Pydantic Validation)")
+    parser = argparse.ArgumentParser(description="ESM-2 Advanced Cross-Attention Fine-tuning (v7)")
     
     parser.add_argument('--config', type=str, required=True, 
                         help="Path to the configuration YAML file.")
@@ -758,17 +975,12 @@ def main() -> None:
     
     args = parser.parse_args()
     
-    # 🛡️ --- Load and Validate Config ---
     config = load_config(args.config)
-    
-    # 🪵 --- Set up logging ---
     setup_logging(config.output_dir)
-    
-    # 🧬 --- Set Seed ---
     set_seed(config.seed)
     
     logging.info("=" * 70)
-    logging.info("ESM-2 Fine-Tuning Script (v6 - Pydantic Validation)")
+    logging.info("ESM-2 Advanced Cross-Attention Fine-Tuning Script (v7)")
     logging.info(f"Loaded and validated configuration from: {args.config}")
     logging.info("=" * 70)
 

@@ -1,39 +1,106 @@
 # ----------------------------------
-# Experiment Configuration File (v6)
+# Advanced Cross-Attention Configuration (v7)
 # ----------------------------------
 
 # --- Core Paths ---
 data_file: "iedb_dataset.csv"
-output_dir: "./checkpoints_4_esm_cba"
+output_dir: "./checkpoints/checkpoints_esm2_advanced_CA"
+
 
 # --- Model ---
-model_name: "smares/ESMCBA"
+model_name: "facebook/esm2_t33_650M_UR50D"
 tokenizer_name: "facebook/esm2_t33_650M_UR50D"
 max_length: 512
+
+
+# --- Cross-Attention Architecture ---
+# NEW: Number of co-attention layers (stack multiple for deeper interaction modeling)
+num_ca_layers: 2
+
+# NEW: Number of attention heads per layer
+num_attention_heads: 8
+
+# NEW: Dropout rate for cross-attention layers
+ca_dropout: 0.1
+
+# NEW: Freeze ESM encoder and only train cross-attention layers
+# Set to true for faster training and to prevent overfitting with small datasets
+freeze_esm: false
+
 
 # --- Data Columns ---
 mhc_col: "mhc_sequence"
 pep_col: "peptide"
 label_col: "binding_affinity_nM"
 
+
 # --- Data Preprocessing ---
 convert_to_pic50: true
 normalize: true
+
 
 # --- Data Splitting & Reproducibility ---
 seed: 42
 test_size: 0.1
 valid_size: 0.1
 
+
 # --- Training Hyperparameters ---
 epochs: 100
 batch_size: 32
 accum_steps: 1
-lr: 1e-6
+lr: 1e-6  # Use lower LR if freeze_esm=false, higher (1e-5) if freeze_esm=true
 scheduler_patience: 3 
 clip_norm: 1.0
 early_stopping_patience: 10
 
+
 # --- Hardware & Performance ---
 use_amp: true
 num_workers: 12
+
+
+# ----------------------------------
+# USAGE NOTES:
+# ----------------------------------
+# 
+# Key improvements over simple concatenation:
+#
+# 1. Multi-layer co-attention: Models complex MHC-peptide interactions through
+#    multiple attention layers, allowing for hierarchical interaction learning
+#
+# 2. Gated fusion: Dynamically weights original vs cross-attended features,
+#    allowing the model to learn when cross-attention is beneficial
+#
+# 3. Attention pooling: Learns to focus on important sequence positions
+#    instead of treating all positions equally (better than mean pooling)
+#
+# 4. Explicit interaction modeling: Captures multiplicative and difference
+#    interactions between MHC and peptide features
+#
+# 5. Bidirectional symmetry: Both sequences attend to each other simultaneously,
+#    ensuring balanced information flow
+#
+# Recommended settings:
+#
+# - For small datasets (<10k samples):
+#   freeze_esm: true
+#   num_ca_layers: 1
+#   lr: 1e-5
+#
+# - For medium datasets (10k-100k samples):
+#   freeze_esm: false
+#   num_ca_layers: 2
+#   lr: 1e-6
+#
+# - For large datasets (>100k samples):
+#   freeze_esm: false
+#   num_ca_layers: 3
+#   lr: 5e-7
+#
+# Monitor validation metrics closely - if cross-attention doesn't improve
+# over concatenation, try:
+# - Increasing num_ca_layers
+# - Enabling freeze_esm
+# - Adjusting learning rate
+# - Increasing ca_dropout to prevent overfitting
