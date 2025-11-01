@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import GradScaler, autocast
-from transformers import AutoTokenizer, AutoConfig, PreTrainedTokenizer, EsmModel
+from transformers import AutoTokenizer, AutoConfig, PreTrainedTokenizer, AutoModel
 from huggingface_hub import hf_hub_download
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
@@ -310,8 +310,16 @@ class ESM2FineTuneModel(nn.Module):
         logging.info(f"  - ESM frozen: {freeze_esm}")
         logging.info(f"  - Warm start gate: {warm_start_gate}")
         
-        self.esm_model = EsmModel.from_pretrained(esm_model_name)
+        try:
+            self.esm_model = AutoModel.from_pretrained(esm_model_name)
+        except:
+            # ESMplusplus might need special loading
+            self.esm_model = AutoModel.from_pretrained(esm_model_name, trust_remote_code=True)
+
         embed_dim = self.esm_model.config.hidden_size
+        
+        logging.info(f"Model type: {type(self.esm_model).__name__}")
+        logging.info(f"Embedding dimension: {embed_dim}")
         
         if freeze_esm:
             for param in self.esm_model.parameters():

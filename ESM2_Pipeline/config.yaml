@@ -5,11 +5,11 @@
 
 # --- Core Paths ---
 data_file: "iedb_dataset.csv"
-output_dir: "./checkpoints/checkpoints_esm2_warmstart"
+output_dir: "./checkpoints/checkpoints_esmc_warmstart"
 
 
 # --- Model ---
-model_name: "facebook/esm2_t33_650M_UR50D"
+model_name: "Synthyra/ESMplusplus_large"
 tokenizer_name: "facebook/esm2_t33_650M_UR50D"
 max_length: 512
 
