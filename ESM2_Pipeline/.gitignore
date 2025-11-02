@@ -5,3 +5,4 @@
 outputs/
 checkpoints*/
 __pycache__/
+params/

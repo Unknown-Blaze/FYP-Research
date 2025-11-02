@@ -1,0 +1,10 @@
+{
+  "success": {},
+  "failed": [
+    0
+  ],
+  "skipped_long": [],
+  "total": 1,
+  "backend": "local_alphafold_multimer",
+  "model": "model_1_ptm"
+}

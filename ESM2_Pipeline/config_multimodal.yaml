@@ -1,0 +1,87 @@
+# ==========================================
+# INTEGRATED SEQUENCE + STRUCTURE CONFIG
+# ==========================================
+
+# --- Sequence Pipeline (Already Trained) ---
+sequence_config:
+  model_name: "Synthyra/ESMplusplus_large"
+  tokenizer_name: "facebook/esm2_t33_650M_UR50D"
+  pretrained_checkpoint: "./sequence_pipeline/checkpoints/checkpoints_esmc_warmstart/best_model.pt"
+  freeze_sequence_encoder: true  # ← Don't retrain sequence encoder
+
+# --- Structure Pipeline (NEW) ---
+structure_config:
+  pdb_dir: "./structure/data/structures"
+  graph_cache_dir: "./structure/data/graphs"
+  
+  # Graph neural network config
+  graph_model: "EGNN"  # Options: EGNN, GAT, GCN, GraphMamba
+  graph_hidden_dim: 256
+  graph_num_layers: 3
+  graph_num_heads: 4
+  graph_dropout: 0.1
+  
+  # Node/Edge features
+  use_node_features: true
+  use_edge_features: true  # Distance, angle, bond type
+  use_esm_embeddings: true  # Combine ESM features with geometry
+
+# --- Cross-Modal Fusion ---
+fusion_config:
+  method: "cross_attention"  # Options: cross_attention, concatenation, bilinear
+  seq_embedding_dim: 1152  # ESMplusplus output
+  struct_embedding_dim: 256  # Graph output
+  fusion_hidden_dim: 512
+  num_fusion_layers: 2
+  fusion_dropout: 0.15
+  warm_start_fusion_gate: 0.1  # 90% seq, 10% struct initially
+
+# --- Training ---
+training_config:
+  epochs: 100
+  batch_size: 32
+  accum_steps: 1
+  
+  # Separate learning rates
+  lr_sequence: 0.00001  # Frozen, no gradient
+  lr_structure: 0.0001  # Train structure encoder
+  lr_fusion: 0.0001     # Train fusion layers
+  
+  scheduler_patience: 3
+  clip_norm: 1.0
+  early_stopping_patience: 10
+  
+  use_amp: true
+  num_workers: 12
+
+# --- Data ---
+data_config:
+  data_file: "iedb_dataset.csv"
+  mhc_col: "mhc_sequence"
+  pep_col: "peptide"
+  label_col: "binding_affinity_nM"
+  
+  # Preprocessing
+  convert_to_pic50: true
+  normalize: true
+  
+  # Split
+  seed: 42
+  test_size: 0.1
+  valid_size: 0.1
+  
+  # Sampling (use subset for testing)
+  sample_fraction: 1.0  # Set to 0.1 for pilot testing
+  max_samples: null
+
+# --- Output ---
+output_config:
+  output_dir: "./multimodal_pipeline/checkpoints"
+  save_best_model: true
+  save_predictions: true
+  log_tensorboard: true
+
+# --- Hardware ---
+hardware_config:
+  device: "cuda"  # or "cpu"
+  num_gpus: 1
