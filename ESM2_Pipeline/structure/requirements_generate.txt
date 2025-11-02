@@ -1,0 +1,14 @@
+torch==2.0.1
+torchvision
+torchaudio
+fair-esm==2.0.0
+biotite==0.40.0
+ml-collections
+dm-tree
+einops
+biopython
+pandas
+scipy
+pyyaml
+omegaconf
+modelcif

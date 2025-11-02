@@ -1,0 +1,45 @@
+{
+  "success": {
+    "0": {
+      "pdb_file": "./data/generated_pdbs/complex_000000_01:01_10.pdb",
+      "mean_plddt": null
+    },
+    "1": {
+      "pdb_file": "./data/generated_pdbs/complex_000001_01:01_9.pdb",
+      "mean_plddt": 91.67440384615374
+    },
+    "2": {
+      "pdb_file": "./data/generated_pdbs/complex_000002_01:01_9.pdb",
+      "mean_plddt": 91.67440384615374
+    },
+    "3": {
+      "pdb_file": "./data/generated_pdbs/complex_000003_01:01_10.pdb",
+      "mean_plddt": 91.84577411167493
+    },
+    "4": {
+      "pdb_file": "./data/generated_pdbs/complex_000004_01:01_10.pdb",
+      "mean_plddt": 91.59168781725907
+    },
+    "5": {
+      "pdb_file": "./data/generated_pdbs/complex_000005_01:01_9.pdb",
+      "mean_plddt": 91.3105407124682
+    },
+    "6": {
+      "pdb_file": "./data/generated_pdbs/complex_000006_01:01_9.pdb",
+      "mean_plddt": 91.97874125874107
+    },
+    "7": {
+      "pdb_file": "./data/generated_pdbs/complex_000007_01:01_9.pdb",
+      "mean_plddt": 91.8096315120712
+    },
+    "8": {
+      "pdb_file": "./data/generated_pdbs/complex_000008_01:01_10.pdb",
+      "mean_plddt": 89.74150442477874
+    },
+    "9": {
+      "pdb_file": "./data/generated_pdbs/complex_000009_01:01_9.pdb",
+      "mean_plddt": 90.70494637223983
+    }
+  },
+  "failed": []
+}
