@@ -6,3 +6,5 @@ outputs/
 checkpoints*/
 __pycache__/
 params/
+localcolabfold/
+structure/data/generated_pdbs

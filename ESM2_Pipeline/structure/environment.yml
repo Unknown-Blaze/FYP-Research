@@ -1,0 +1,11 @@
+name: colabfold
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - cudatoolkit
+  - cudnn
+  - pip
+  - pip:
+    - colabfold
+    - colabfold[alphafold]

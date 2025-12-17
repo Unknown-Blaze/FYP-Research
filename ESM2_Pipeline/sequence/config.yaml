@@ -6,66 +6,30 @@
 # --- Core Paths ---
 data_file: "../iedb_dataset.csv"
 output_dir: "../checkpoints/checkpoints_esm2_warmstart"
-
-
-# --- Model ---
 model_name: "facebook/esm2_t33_650M_UR50D"
 tokenizer_name: "facebook/esm2_t33_650M_UR50D"
 max_length: 512
-
-
-# --- Cross-Attention Architecture ---
-# CRITICAL: Freeze ESM so attention can learn without destroying pretrained features
 freeze_esm: false
-
-# Start simple with 1 layer
 num_ca_layers: 1
-
 num_attention_heads: 8
-
-# Higher dropout since we're training attention from scratch
 ca_dropout: 0.15
-
-# WARM START: Initialize gates to favor ESM features (90%) over attention (10%)
-# This prevents the "random attention corrupts ESM" problem in epoch 1
 warm_start_gate: 0.1
-
-
-# --- Data Columns ---
 mhc_col: "mhc_sequence"
 pep_col: "peptide"
 label_col: "binding_affinity_nM"
-
-
-# --- Data Preprocessing ---
 convert_to_pic50: true
 normalize: true
-
-
-# --- Data Splitting & Reproducibility ---
 seed: 42
 test_size: 0.1
 valid_size: 0.1
-
-
-# --- Training Hyperparameters ---
 epochs: 100
 batch_size: 32
 accum_steps: 1
-
-# Base learning rate (for ESM if not frozen)
 lr: 0.00001
-
-# CRITICAL: Attention layers get 10x higher learning rate
-# Since attention starts from scratch while ESM is pretrained
 lr_attention_multiplier: 10.0
-
 scheduler_patience: 3 
 clip_norm: 1.0
 early_stopping_patience: 10
-
-
-# --- Hardware & Performance ---
 use_amp: true
 num_workers: 12
 
