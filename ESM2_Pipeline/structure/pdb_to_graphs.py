@@ -1,10 +1,10 @@
 """
-Convert PDB structures to graph representations for GNN processing
+Convert PDB structures to graph representations for GNN processing (Enhanced)
 
-Creates molecular graphs where:
-- Nodes = atoms (CA only for simplicity, or all atoms)
-- Edges = spatial proximity (<5Å) or bond connections
-- Features = atom type, pLDDT confidence, position
+Updates:
+- Node Features: Atom Type (One-hot) + Residue Type (One-hot) + pLDDT
+- Edges: Spatial proximity (<5Å)
+- Edge Features: Raw distance + Inverse distance
 
 Output: PyTorch Geometric Data objects saved as .pt files
 """
@@ -13,12 +13,51 @@ import argparse
 from pathlib import Path
 import numpy as np
 import torch
-from torch_geometric.data import Data, DataLoader
+from torch_geometric.data import Data
 import logging
-from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Constants & Mappings
+# ============================================================================
+
+# ... (Keep your existing AMINO_ACIDS and ATOM_TYPES) ...
+
+# === NEW: CHEMICAL KNOWLEDGE BANK ===
+# 1. Hydrophobicity (Kyte-Doolittle scale, normalized approx)
+HYDROPHOBICITY = {
+    'ALA': 1.8, 'ARG': -4.5, 'ASN': -3.5, 'ASP': -3.5, 'CYS': 2.5,
+    'GLN': -3.5, 'GLU': -3.5, 'GLY': -0.4, 'HIS': -3.2, 'ILE': 4.5,
+    'LEU': 3.8, 'LYS': -3.9, 'MET': 1.9, 'PHE': 2.8, 'PRO': -1.6,
+    'SER': -0.8, 'THR': -0.7, 'TRP': -0.9, 'TYR': -1.3, 'VAL': 4.2
+}
+
+# 2. Charge (at physiological pH 7.4)
+CHARGE = {
+    'ARG': 1.0, 'LYS': 1.0, 'ASP': -1.0, 'GLU': -1.0, 
+    'HIS': 0.1  # Histidine is partially protonated/neutral
+}
+
+# 3. Hydrogen Bonding (Simplified: [Donor, Acceptor])
+# 1 = Yes, 0 = No
+HBOND = {
+    'ASN': [1,1], 'GLN': [1,1], 'SER': [1,1], 'THR': [1,1], 'TYR': [1,1], 
+    'ASP': [0,1], 'GLU': [0,1], 'LYS': [1,0], 'ARG': [1,0], 'HIS': [1,1],
+    'TRP': [1,0]
+}
+
+# Standard 20 Amino Acids (3-letter codes)
+AMINO_ACIDS = [
+    'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE',
+    'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL'
+]
+AA_TO_IDX = {aa: i for i, aa in enumerate(AMINO_ACIDS)}
+
+# Common Atom Types in Proteins
+ATOM_TYPES = ['C', 'N', 'O', 'S']
+ATOM_TO_IDX = {a: i for i, a in enumerate(ATOM_TYPES)}
 
 # ============================================================================
 # PDB Parsing
@@ -26,14 +65,7 @@ logger = logging.getLogger(__name__)
 
 def parse_pdb(pdb_file: Path, use_all_atoms: bool = False):
     """
-    Parse PDB file and extract atom coordinates, types, and B-factors (pLDDT).
-    
-    Args:
-        pdb_file: Path to PDB file
-        use_all_atoms: If True, use all atoms. If False, use CA only.
-    
-    Returns:
-        atoms: list of (atom_type, x, y, z, b_factor)
+    Parse PDB file and extract atom details including Residue Information.
     """
     atoms = []
     
@@ -43,17 +75,26 @@ def parse_pdb(pdb_file: Path, use_all_atoms: bool = False):
                 continue
             
             try:
+                # Standard PDB Column format
                 atom_name = line[12:16].strip()
+                res_name = line[17:20].strip()
+                
+                # Coordinates
                 x = float(line[30:38].strip())
                 y = float(line[38:46].strip())
                 z = float(line[46:54].strip())
                 b_factor = float(line[60:66].strip())  # pLDDT
                 
+                # Element symbol (cols 76-78) or infer from name
+                element = line[76:78].strip()
+                if not element:
+                    element = atom_name[0] # Fallback
+                
                 # Filter: CA only or all atoms
                 if use_all_atoms or atom_name == 'CA':
-                    atom_type = line[76:78].strip() if len(line) > 77 else 'C'
                     atoms.append({
-                        'type': atom_type or 'C',
+                        'element': element,
+                        'res_name': res_name,
                         'pos': np.array([x, y, z], dtype=np.float32),
                         'plddt': b_factor
                     })
@@ -68,73 +109,91 @@ def parse_pdb(pdb_file: Path, use_all_atoms: bool = False):
 
 def atoms_to_graph(atoms: list, distance_threshold: float = 5.0) -> Data:
     """
-    Convert atom list to PyTorch Geometric Data object.
-    
-    Creates edges between atoms within distance_threshold.
-    
-    Args:
-        atoms: List of atom dicts with 'type', 'pos', 'plddt'
-        distance_threshold: Max distance (Å) for edge creation
-    
-    Returns:
-        PyTorch Geometric Data object
+    Convert atom list to PyTorch Geometric Data object with CHEMICAL features.
     """
     if len(atoms) == 0:
         return None
     
-    # Node features: one-hot atom type + pLDDT
-    atom_types = sorted(set(a['type'] for a in atoms))
-    type_to_idx = {t: i for i, t in enumerate(atom_types)}
-    
+    # 1. Build Node Features
+    # ---------------------------------------------------------
     node_features = []
     positions = []
-    plddt_scores = []
     
     for atom in atoms:
-        # One-hot encode atom type
-        one_hot = np.zeros(len(atom_types), dtype=np.float32)
-        one_hot[type_to_idx[atom['type']]] = 1
+        res = atom['res_name']
         
-        node_features.append(one_hot)
+        # A. Atom Type One-Hot (Length: 5)
+        atom_one_hot = np.zeros(len(ATOM_TYPES) + 1, dtype=np.float32)
+        if atom['element'] in ATOM_TO_IDX:
+            atom_one_hot[ATOM_TO_IDX[atom['element']]] = 1.0
+        else:
+            atom_one_hot[-1] = 1.0 
+            
+        # B. Residue Type One-Hot (Length: 21)
+        res_one_hot = np.zeros(len(AMINO_ACIDS) + 1, dtype=np.float32)
+        if res in AA_TO_IDX:
+            res_one_hot[AA_TO_IDX[res]] = 1.0
+        else:
+            res_one_hot[-1] = 1.0
+            
+        # C. Physicochemical Properties (The Upgrade)
+        # ------------------------------------------------
+        # 1. Hydrophobicity (Normalized by division)
+        hyd = [HYDROPHOBICITY.get(res, 0.0) / 4.5]
+        
+        # 2. Charge
+        chg = [CHARGE.get(res, 0.0)]
+        
+        # 3. H-Bond Capability [Donor, Acceptor]
+        hb = HBOND.get(res, [0, 0])
+        
+        # 4. pLDDT (Confidence)
+        plddt_norm = [atom['plddt'] / 100.0]
+
+        # Combine all features
+        # Vector Size: 5 (Atom) + 21 (Res) + 1 (Hyd) + 1 (Chg) + 2 (HB) + 1 (pLDDT) = 31 dims
+        feat = np.concatenate([atom_one_hot, res_one_hot, hyd, chg, hb, plddt_norm])
+        
+        node_features.append(feat)
         positions.append(atom['pos'])
-        plddt_scores.append(atom['plddt'])
     
-    # Stack features
-    x = np.column_stack([node_features, plddt_scores])  # (N, atom_types + 1)
-    x = torch.tensor(x, dtype=torch.float32)
+    x = torch.tensor(np.array(node_features), dtype=torch.float32)
     pos = torch.tensor(np.array(positions), dtype=torch.float32)
     
-    # Create edges: distance-based
-    positions_arr = np.array(positions)
-    n_atoms = len(atoms)
-    edges = []
-    edge_weights = []
+    # 2. Build Edges (Internal Distance Based)
+    # ---------------------------------------------------------
+    # Note: This only builds edges WITHIN the MHC or WITHIN the Peptide
+    # because they are processed separately.
     
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            dist = np.linalg.norm(positions_arr[i] - positions_arr[j])
-            if dist < distance_threshold:
-                edges.append([i, j])
-                edges.append([j, i])  # Undirected
-                edge_weights.append(1.0 / (dist + 1e-6))  # Weight by inverse distance
-                edge_weights.append(1.0 / (dist + 1e-6))
+    positions_arr = np.array(positions)
+    
+    # Calculate distances
+    dist_matrix = np.linalg.norm(positions_arr[:, None, :] - positions_arr[None, :, :], axis=-1)
+    
+    # Create mask (Threshold + Self-loop removal)
+    mask = (dist_matrix < distance_threshold) & (dist_matrix > 1e-6)
+    src_nodes, dst_nodes = np.where(mask)
+    
+    edges = []
+    edge_attributes = []
+    
+    for src, dst in zip(src_nodes, dst_nodes):
+        dist = dist_matrix[src, dst]
+        
+        edges.append([src, dst])
+        
+        # Edge Features: [Distance, 1/Distance]
+        attr = [dist, 1.0 / (dist + 1e-6)]
+        edge_attributes.append(attr)
     
     if edges:
         edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-        edge_attr = torch.tensor(edge_weights, dtype=torch.float32).unsqueeze(1)
+        edge_attr = torch.tensor(edge_attributes, dtype=torch.float32)
     else:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
-        edge_attr = torch.zeros((0, 1), dtype=torch.float32)
+        edge_attr = torch.zeros((0, 2), dtype=torch.float32)
     
-    # Create PyG Data object
-    data = Data(
-        x=x,
-        pos=pos,
-        edge_index=edge_index,
-        edge_attr=edge_attr
-    )
-    
-    return data
+    return Data(x=x, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
 
 # ============================================================================
 # Batch Processing
@@ -142,120 +201,62 @@ def atoms_to_graph(atoms: list, distance_threshold: float = 5.0) -> Data:
 
 def convert_directory(pdb_dir: Path, output_dir: Path, use_all_atoms: bool = False, 
                       distance_threshold: float = 5.0):
-    """
-    Convert all PDB files in a directory to graph files.
-    
-    Args:
-        pdb_dir: Input directory with PDB files
-        output_dir: Output directory for .pt graph files
-        use_all_atoms: Use all atoms or CA only
-        distance_threshold: Distance threshold for edges
-    """
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    pdb_files = list(pdb_dir.glob('*rank_001*.pdb'))
+    # Find all PDBs (adjust glob pattern if needed)
+    pdb_files = list(pdb_dir.glob('*.pdb'))
     logger.info(f"Found {len(pdb_files)} PDB files in {pdb_dir}")
     
     success = 0
-    failed = 0
-    skipped = 0
     
     for i, pdb_file in enumerate(pdb_files, 1):
-        if i % 1000 == 0:
+        if i % 100 == 0:
             logger.info(f"  Processed {i}/{len(pdb_files)}")
         
-        # Check if already converted
         output_file = output_dir / f"{pdb_file.stem}.pt"
         if output_file.exists():
-            skipped += 1
             continue
         
         try:
             atoms = parse_pdb(pdb_file, use_all_atoms=use_all_atoms)
-            
             if not atoms:
-                logger.warning(f"No atoms found in {pdb_file.name}")
-                failed += 1
                 continue
             
             graph = atoms_to_graph(atoms, distance_threshold=distance_threshold)
             
-            if graph is None:
-                failed += 1
-                continue
-            
-            torch.save(graph, output_file)
-            success += 1
-            
+            if graph is not None:
+                torch.save(graph, output_file)
+                success += 1
+                
         except Exception as e:
             logger.warning(f"Error processing {pdb_file.name}: {e}")
-            failed += 1
-    
-    logger.info(f"✓ Conversion complete!")
-    logger.info(f"  Success: {success}")
-    logger.info(f"  Failed: {failed}")
-    logger.info(f"  Skipped (already converted): {skipped}")
-    logger.info(f"  Output directory: {output_dir}")
+            continue
+            
+    logger.info(f"Conversion complete. Successfully converted {success} files.")
 
 # ============================================================================
 # Main
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert PDB files to graph representations for GNN')
-    parser.add_argument('--mhc-pdb-dir', default='data/generated_pdbs/mhc',
-                       help='Path to MHC PDB directory')
-    parser.add_argument('--peptide-pdb-dir', default='data/generated_pdbs/peptide',
-                       help='Path to peptide PDB directory')
-    parser.add_argument('--output-dir', default='data/graphs',
-                       help='Output directory for graph files')
-    parser.add_argument('--all-atoms', action='store_true',
-                       help='Use all atoms instead of CA only')
-    parser.add_argument('--distance-threshold', type=float, default=5.0,
-                       help='Distance threshold for edges (Å)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mhc-pdb-dir', type=str, required=True)
+    parser.add_argument('--peptide-pdb-dir', type=str, required=True)
+    parser.add_argument('--output-dir', default='data/graphs')
+    parser.add_argument('--all-atoms', action='store_true', help='Use all atoms (default is CA only)')
+    parser.add_argument('--distance-threshold', type=float, default=5.0)
     
     args = parser.parse_args()
     
-    logger.info("=" * 70)
-    logger.info("CONVERTING PDB FILES TO GRAPHS FOR GNN")
-    logger.info("=" * 70)
-    logger.info("")
-    
     base_out = Path(args.output_dir)
-    mhc_out = base_out / 'mhc'
-    peptide_out = base_out / 'peptide'
     
-    # Convert MHC structures
-    logger.info("Converting MHC structures...")
-    logger.info("-" * 70)
-    convert_directory(
-        Path(args.mhc_pdb_dir),
-        mhc_out,
-        use_all_atoms=args.all_atoms,
-        distance_threshold=args.distance_threshold
-    )
-    
-    logger.info("")
-    
-    # Convert peptide structures
-    logger.info("Converting peptide structures...")
-    logger.info("-" * 70)
-    convert_directory(
-        Path(args.peptide_pdb_dir),
-        peptide_out,
-        use_all_atoms=args.all_atoms,
-        distance_threshold=args.distance_threshold
-    )
-    
-    logger.info("")
-    logger.info("=" * 70)
-    logger.info("✓ ALL CONVERSIONS COMPLETE")
-    logger.info("=" * 70)
-    logger.info("")
-    logger.info(f"Graph files ready for GNN training:")
-    logger.info(f"  MHC graphs: {mhc_out}")
-    logger.info(f"  Peptide graphs: {peptide_out}")
-    logger.info("")
+    logger.info(f"Processing MHC PDBs from {args.mhc_pdb_dir}...")
+    convert_directory(Path(args.mhc_pdb_dir), base_out / 'mhc', 
+                     args.all_atoms, args.distance_threshold)
+                     
+    logger.info(f"Processing Peptide PDBs from {args.peptide_pdb_dir}...")
+    convert_directory(Path(args.peptide_pdb_dir), base_out / 'peptide', 
+                     args.all_atoms, args.distance_threshold)
 
 if __name__ == '__main__':
     main()

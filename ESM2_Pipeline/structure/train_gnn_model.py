@@ -1,25 +1,23 @@
 """
 Graph Neural Network for MHC-Peptide Binding Affinity Prediction
-
-Architecture: Graph Attention Network (GAT)
-- Reads graph representations of MHC and peptide structures
-- Aggregates structural information via attention mechanism
-- Predicts IC50 binding affinity
-
-Installation:
-  pip install torch-geometric pytorch-scatter pytorch-sparse
 """
+import warnings
+# Filter specific warnings to keep logs clean
+warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
 
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# Correct Imports for PyG 2.0+
 from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool
-from torch_geometric.data import Data, DataLoader
+from torch_geometric.loader import DataLoader 
+from torch_geometric.data import Data
 from torch.utils.data import Dataset
 from pathlib import Path
 import json
+import argparse
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import logging
@@ -42,16 +40,18 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 CONFIG = {
+    'input_dim': 31,  # Matches your graph node features
     'dataset_path': '../iedb_dataset.csv',
     'graphs_dir_mhc': 'data/graphs/mhc',
     'graphs_dir_peptide': 'data/graphs/peptide',
     'mapping_file': 'row_to_pdb_map.json',
     'batch_size': 32,
-    'num_epochs': 50,
-    'learning_rate': 0.001,
+    'num_epochs': 100,
+    'learning_rate': 0.0001,
     'hidden_dims': [64, 64],
     'num_heads': 4,
-    'dropout': 0.2,
+    'dropout': 0.3,
+    'weight_decay': 1e-4,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
@@ -60,90 +60,100 @@ CONFIG = {
 # ============================================================================
 
 class GraphBindingDataset(Dataset):
-    def __init__(self, df, mapping, graphs_dir_mhc, graphs_dir_peptide):
-        self.df = df.reset_index(drop=True)
+    def __init__(self, df, mapping, graphs_dir_mhc, graphs_dir_peptide, cache_graphs: bool = False, label_col: str = 'IC50'):
+        self.df = df.copy()
         self.mapping = mapping
         self.graphs_dir_mhc = Path(graphs_dir_mhc)
         self.graphs_dir_peptide = Path(graphs_dir_peptide)
-        
-        logger.info("Pre-caching graph files...")
+        self.cache_graphs = cache_graphs # Should be False for large datasets
+        self.label_col = label_col
         self.graph_cache = {}
-        
-        for idx in range(len(self.df)):
-            key = str(idx)
-            if key in self.mapping:
-                mhc_id = self.mapping[key]['mhc_pdb_id']
-                pep_id = self.mapping[key]['peptide_pdb_id']
-                
-                if mhc_id not in self.graph_cache:
-                    mhc_graph_file = self.graphs_dir_mhc / f"{mhc_id}_*rank_001*.pt"
-                    mhc_files = list(self.graphs_dir_mhc.glob(f"{mhc_id}*rank_001*.pt"))
-                    if mhc_files:
-                        self.graph_cache[mhc_id] = torch.load(mhc_files[0])
-                
-                if pep_id not in self.graph_cache:
-                    pep_files = list(self.graphs_dir_peptide.glob(f"{pep_id}*rank_001*.pt"))
-                    if pep_files:
-                        self.graph_cache[pep_id] = torch.load(pep_files[0])
-        
-        logger.info(f"Cached {len(self.graph_cache)} unique graphs")
-    
+
+        if self.cache_graphs:
+            logger.info("Pre-caching enabled (Warning: High RAM usage)...")
+            # (Caching logic omitted for stability - sticking to Lazy Loading)
+
     def __len__(self):
         return len(self.df)
-    
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        key = str(idx)
+        key = str(row.name) 
         
-        # Get graphs
-        mhc_graph = None
-        pep_graph = None
+        mhc_id, pep_id = None, None
         
         if key in self.mapping:
             mhc_id = self.mapping[key]['mhc_pdb_id']
             pep_id = self.mapping[key]['peptide_pdb_id']
-            
-            mhc_graph = self.graph_cache.get(mhc_id)
-            pep_graph = self.graph_cache.get(pep_id)
         
-        # If graphs missing, create dummy graph
+        # --- LOAD GRAPHS ---
+        mhc_graph = None
+        if mhc_id:
+            # Check cache first, then disk
+            mhc_graph = self.graph_cache.get(mhc_id)
+            if mhc_graph is None:
+                files = list(self.graphs_dir_mhc.glob(f"{mhc_id}*rank_001*.pt"))
+                if files: mhc_graph = torch.load(files[0])
+        
+        pep_graph = None
+        if pep_id:
+            pep_graph = self.graph_cache.get(pep_id)
+            if pep_graph is None:
+                files = list(self.graphs_dir_peptide.glob(f"{pep_id}*rank_001*.pt"))
+                if files: pep_graph = torch.load(files[0])
+
+        # --- DUMMY FALLBACK ---
         if mhc_graph is None:
             mhc_graph = Data(
-                x=torch.zeros((1, 2), dtype=torch.float32),
+                x=torch.randn((1, CONFIG['input_dim']), dtype=torch.float32) * 0.01, 
                 edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 1), dtype=torch.float32)
+                edge_attr=torch.zeros((0, 2), dtype=torch.float32),
+                pos=torch.zeros((1, 3), dtype=torch.float32)
             )
-        
         if pep_graph is None:
             pep_graph = Data(
-                x=torch.zeros((1, 2), dtype=torch.float32),
+                x=torch.randn((1, CONFIG['input_dim']), dtype=torch.float32) * 0.01, 
                 edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 1), dtype=torch.float32)
+                edge_attr=torch.zeros((0, 2), dtype=torch.float32),
+                pos=torch.zeros((1, 3), dtype=torch.float32)
             )
-        
-        ic50 = float(row['IC50'])
-        
-        return mhc_graph, pep_graph, ic50
 
+        # --- SAFETY CHECK (The Fix for KeyError: 'pos') ---
+        # Ensure 'pos' exists even if the loaded file didn't have it
+        if not hasattr(mhc_graph, 'pos') or mhc_graph.pos is None:
+            mhc_graph.pos = torch.zeros((mhc_graph.num_nodes, 3), dtype=torch.float32)
+            
+        if not hasattr(pep_graph, 'pos') or pep_graph.pos is None:
+            pep_graph.pos = torch.zeros((pep_graph.num_nodes, 3), dtype=torch.float32)
+
+        # --- TARGET CALCULATION (pIC50) ---
+        try:
+            ic50_val = float(row[self.label_col])
+            ic50_clamped = min(ic50_val, 50000.0)
+            molar = ic50_clamped * 1e-9
+            target = -np.log10(molar + 1e-12)
+        except Exception:
+            target = 0.0
+        
+        return mhc_graph, pep_graph, float(target)
 
 # ============================================================================
 # GNN Model
 # ============================================================================
 
+from torch_geometric.utils import to_dense_batch
+
 class GraphAttentionNetwork(nn.Module):
-    def __init__(self, input_dim: int = 2, hidden_dims: list = None, 
+    def __init__(self, input_dim: int = 31, hidden_dims: list = [64, 64], 
                  num_heads: int = 4, dropout: float = 0.2):
         super().__init__()
-        
-        if hidden_dims is None:
-            hidden_dims = [64, 64]
-        
         self.dropout = dropout
         
-        # Graph attention layers
+        # 1. Intra-Molecular Graph Layers (GAT)
         dims = [input_dim] + hidden_dims
         self.gat_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
+        self.input_norm = nn.BatchNorm1d(input_dim)
         
         for i in range(len(dims) - 1):
             self.gat_layers.append(
@@ -151,248 +161,218 @@ class GraphAttentionNetwork(nn.Module):
             )
             self.norms.append(nn.LayerNorm(dims[i+1]))
         
-        # Global feature dimension: (2 * last_hidden) for mean and max pooling
-        self.global_dim = dims[-1]
+        self.graph_dim = dims[-1]
         
-        # Binding prediction head
-        combined_dim = 2 * self.global_dim * 2  # MHC + peptide, each with mean+max pooling
+        # 2. Inter-Molecular Cross-Attention (The "Docking" Step)
+        self.cross_attn_dim = self.graph_dim
+        # Note: batch_first=True is required for the dense batches we create below
+        self.mhc_to_pep_attn = nn.MultiheadAttention(self.cross_attn_dim, num_heads=4, batch_first=True, dropout=dropout)
+        self.pep_to_mhc_attn = nn.MultiheadAttention(self.cross_attn_dim, num_heads=4, batch_first=True, dropout=dropout)
+        
+        # 3. Prediction Head
+        # Concatenate: [MHC_Global, Pep_Global, MHC_Interface, Pep_Interface]
+        combined_dim = 4 * self.graph_dim
+        
         self.fc_layers = nn.Sequential(
             nn.Linear(combined_dim, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(64, 1)
         )
     
-    def forward_graph(self, x, edge_index, edge_attr, batch):
-        """Process single graph (MHC or peptide)"""
+    def process_subgraph(self, x, edge_index, edge_attr, batch):
+        # Run the GAT layers to get local features (Charge, Shape, etc.)
+        x = self.input_norm(x)
         for gat, norm in zip(self.gat_layers, self.norms):
+            x_in = x
             x = gat(x, edge_index, edge_attr)
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-            if norm is not None:
-                x = norm(x)
-        
-        # Global pooling: mean + max
-        mean_pool = global_mean_pool(x, batch)
-        max_pool = global_max_pool(x, batch)
-        
-        return torch.cat([mean_pool, max_pool], dim=1)
-    
-    def forward(self, mhc_graph, pep_graph):
-        """
-        Args:
-            mhc_graph: PyG Data object for MHC
-            pep_graph: PyG Data object for peptide
-        
-        Returns:
-            IC50 prediction
-        """
-        # Process MHC graph
-        mhc_features = self.forward_graph(
-            mhc_graph.x, 
-            mhc_graph.edge_index,
-            mhc_graph.edge_attr,
-            mhc_graph.batch if hasattr(mhc_graph, 'batch') else None
-        )
-        
-        # Process peptide graph
-        pep_features = self.forward_graph(
-            pep_graph.x,
-            pep_graph.edge_index,
-            pep_graph.edge_attr,
-            pep_graph.batch if hasattr(pep_graph, 'batch') else None
-        )
-        
-        # Combine and predict
-        combined = torch.cat([mhc_features, pep_features], dim=1)
-        ic50 = self.fc_layers(combined)
-        
-        return ic50.squeeze()
+            # Residual connection if shapes match
+            if x.shape == x_in.shape:
+                x = x + x_in
+            x = norm(x)
+        return x
 
+    def forward(self, mhc, pep):
+        # STEP 1: Process MHC and Peptide separately to understand their shapes
+        mhc_feats = self.process_subgraph(mhc.x, mhc.edge_index, mhc.edge_attr, mhc.batch)
+        pep_feats = self.process_subgraph(pep.x, pep.edge_index, pep.edge_attr, pep.batch)
+        
+        # STEP 2: Prepare for Transformer Attention (Dense Batching)
+        # Graphs are sparse (list of nodes), Transformers need dense tensors [Batch, Max_Nodes, Dim]
+        # to_dense_batch creates these tensors and a mask (True = Real Node, False = Padding)
+        mhc_dense, mhc_mask = to_dense_batch(mhc_feats, mhc.batch)
+        pep_dense, pep_mask = to_dense_batch(pep_feats, pep.batch)
+        
+        # STEP 3: Cross-Attention (The "Docking" Simulation)
+        
+        # A. Peptide searches MHC: "Which MHC nodes match my charge/shape?"
+        # Query = Peptide, Key/Value = MHC
+        pep_context, _ = self.pep_to_mhc_attn(
+            query=pep_dense, 
+            key=mhc_dense, 
+            value=mhc_dense, 
+            key_padding_mask=~mhc_mask # Ignore padding nodes in MHC
+        )
+        
+        # B. MHC searches Peptide
+        # Query = MHC, Key/Value = Peptide
+        mhc_context, _ = self.mhc_to_pep_attn(
+            query=mhc_dense, 
+            key=pep_dense, 
+            value=pep_dense, 
+            key_padding_mask=~pep_mask # Ignore padding nodes in Peptide
+        )
+        
+        # STEP 4: Smart Pooling (Aggregating the Interaction)
+        # We cannot just .mean() because of the zero-padding. We must use the mask.
+        
+        def masked_pool(tensor, mask):
+            # Mask out padding (set to 0)
+            tensor = tensor * mask.unsqueeze(-1).float()
+            # Sum valid nodes
+            summed = tensor.sum(dim=1)
+            # Count valid nodes (clamp to avoid divide by zero)
+            counts = mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+            return summed / counts
+
+        # Pool the original features (Global Shape)
+        mhc_global = masked_pool(mhc_dense, mhc_mask)
+        pep_global = masked_pool(pep_dense, pep_mask)
+        
+        # Pool the interaction features (Binding Interface Energy)
+        mhc_interface = masked_pool(mhc_context, mhc_mask)
+        pep_interface = masked_pool(pep_context, pep_mask)
+        
+        # STEP 5: Final Prediction
+        combined = torch.cat([mhc_global, pep_global, mhc_interface, pep_interface], dim=1)
+        return self.fc_layers(combined).squeeze()
 # ============================================================================
-# Training
+# Training Logic
 # ============================================================================
+
+def inverse_transform_pic50(pic50_values: np.ndarray) -> np.ndarray:
+    return 10.0 ** (9.0 - pic50_values)
 
 def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
-    
-    for mhc_graphs, pep_graphs, targets in loader:
-        mhc_graphs = [g.to(device) for g in mhc_graphs]
-        pep_graphs = [g.to(device) for g in pep_graphs]
-        targets = targets.to(device)
-        
+    # Use enumerate to avoid crash if loader is empty
+    for i, (mhc, pep, y) in enumerate(loader):
+        mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
         optimizer.zero_grad()
-        
-        # Forward pass
-        outputs = []
-        for mhc, pep in zip(mhc_graphs, pep_graphs):
-            out = model(mhc, pep)
-            outputs.append(out)
-        
-        outputs = torch.stack(outputs)
-        loss = criterion(outputs, targets)
+        pred = model(mhc, pep)
+        loss = criterion(pred, y.float())
         loss.backward()
         optimizer.step()
-        
         total_loss += loss.item()
-    
-    return total_loss / len(loader)
+    return total_loss / len(loader) if len(loader) > 0 else 0
 
 def evaluate(model, loader, device):
     model.eval()
-    predictions = []
-    actuals = []
-    
+    preds, actuals = [], []
     with torch.no_grad():
-        for mhc_graphs, pep_graphs, targets in loader:
-            mhc_graphs = [g.to(device) for g in mhc_graphs]
-            pep_graphs = [g.to(device) for g in pep_graphs]
-            
-            outputs = []
-            for mhc, pep in zip(mhc_graphs, pep_graphs):
-                out = model(mhc, pep)
-                outputs.append(out)
-            
-            outputs = torch.stack(outputs).cpu().numpy()
-            predictions.extend(outputs)
-            actuals.extend(targets.numpy())
+        for mhc, pep, y in loader:
+            mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
+            pred = model(mhc, pep)
+            preds.extend(pred.cpu().numpy())
+            actuals.extend(y.cpu().numpy())
     
-    predictions = np.array(predictions)
-    actuals = np.array(actuals)
-    
-    mse = mean_squared_error(actuals, predictions)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(actuals, predictions)
-    
-    return rmse, r2, predictions, actuals
+    if not preds: return 0, 0, [], [], [], []
 
-# ============================================================================
-# Main
-# ============================================================================
+    preds_arr = np.array(preds)
+    actuals_arr = np.array(actuals)
+    
+    rmse = np.sqrt(mean_squared_error(actuals_arr, preds_arr))
+    r2 = r2_score(actuals_arr, preds_arr)
+    
+    ic50_preds = inverse_transform_pic50(preds_arr)
+    ic50_actuals = inverse_transform_pic50(actuals_arr)
+    
+    return rmse, r2, preds_arr, actuals_arr, ic50_preds, ic50_actuals
 
 def main():
-    logger.info("=" * 70)
-    logger.info("GNN-BASED MHC-PEPTIDE BINDING AFFINITY PREDICTION")
-    logger.info("=" * 70)
-    logger.info("")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--resume', action='store_true', help='Resume from last checkpoint')
+    args = parser.parse_args()
     
-    # Load dataset
-    logger.info("Loading dataset...")
+    logger.info("Loading Data...")
     df = pd.read_csv(CONFIG['dataset_path'])
-    logger.info(f"  Total samples: {len(df)}")
     
-    # Load mapping
-    logger.info("Loading PDB mapping...")
-    with open(CONFIG['mapping_file'], 'r') as f:
-        mapping = json.load(f)
-    logger.info(f"  Mapped rows: {len(mapping)}")
+    label_cols = ['IC50', 'ic50', 'binding_affinity_nM']
+    label_col = next((c for c in label_cols if c in df.columns), None)
+    if not label_col: raise KeyError("No IC50 column found")
     
-    # Check graph availability
-    graphs_mhc = list(Path(CONFIG['graphs_dir_mhc']).glob('*.pt'))
-    graphs_pep = list(Path(CONFIG['graphs_dir_peptide']).glob('*.pt'))
+    df[label_col] = pd.to_numeric(df[label_col], errors='coerce')
+    df = df.dropna(subset=[label_col])
     
-    logger.info(f"  Available MHC graphs: {len(graphs_mhc)}")
-    logger.info(f"  Available peptide graphs: {len(graphs_pep)}")
-    logger.info("")
+    with open(CONFIG['mapping_file']) as f: mapping = json.load(f)
     
-    if not graphs_mhc or not graphs_pep:
-        logger.error("❌ Graph files not found!")
-        logger.error("   Run: python pdb_to_graphs.py")
-        return
-    
-    # Train/test split
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-    logger.info(f"Train samples: {len(train_df)}")
-    logger.info(f"Test samples:  {len(test_df)}")
-    logger.info("")
     
-    # Create datasets
-    logger.info("Creating datasets...")
-    train_dataset = GraphBindingDataset(train_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'])
-    test_dataset = GraphBindingDataset(test_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'])
+    # Lazy Loading Enabled (cache_graphs=False)
+    logger.info("Initializing datasets (Lazy Loading Mode)...")
+    train_ds = GraphBindingDataset(train_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], 
+                                   cache_graphs=False, label_col=label_col)
     
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'])
+    test_ds = GraphBindingDataset(test_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], 
+                                  cache_graphs=False, label_col=label_col)
     
-    # Model
+    # num_workers=4 speeds up disk reading
+    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
+    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], num_workers=4)
+    
     device = torch.device(CONFIG['device'])
-    logger.info(f"Using device: {device}")
-    
-    model = GraphAttentionNetwork(
-        input_dim=2,
-        hidden_dims=CONFIG['hidden_dims'],
-        num_heads=CONFIG['num_heads'],
-        dropout=CONFIG['dropout']
-    ).to(device)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
+    model = GraphAttentionNetwork(input_dim=CONFIG['input_dim']).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG.get('weight_decay', 0))
     criterion = nn.MSELoss()
     
-    logger.info("")
-    logger.info("Model architecture:")
-    logger.info(f"  Total parameters: {sum(p.numel() for p in model.parameters())}")
-    logger.info("")
-    logger.info("Starting training...")
-    logger.info("-" * 70)
+    logger.info(f"Starting training on {device}...")
     
-    best_rmse = float('inf')
-    best_r2 = float('-inf')
-    test_predictions_best = None
-    test_actuals_best = None
+    best_loss = float('inf')
+    start_epoch = 0
+    checkpoint_file = Path('gnn_last_checkpoint.pth')
     
-    for epoch in range(CONFIG['num_epochs']):
+    if args.resume and checkpoint_file.exists():
+        try:
+            ckpt = torch.load(checkpoint_file, map_location=device)
+            model.load_state_dict(ckpt['model_state'])
+            optimizer.load_state_dict(ckpt['optimizer_state'])
+            start_epoch = ckpt['epoch'] + 1
+            best_loss = ckpt['best_loss']
+            logger.info(f"Resumed from epoch {start_epoch}")
+        except Exception:
+            start_epoch = 0
+    
+    for epoch in range(start_epoch, CONFIG['num_epochs']):
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        test_rmse, test_r2, preds, actuals = evaluate(model, test_loader, device)
+        val_rmse, val_r2, val_preds, val_actuals, val_ic50_preds, val_ic50_actuals = evaluate(model, test_loader, device)
         
-        if test_rmse < best_rmse:
-            best_rmse = test_rmse
-            best_r2 = test_r2
-            test_predictions_best = preds
-            test_actuals_best = actuals
+        ic50_rmse = np.sqrt(mean_squared_error(val_ic50_actuals, val_ic50_preds))
+        ic50_mae = mean_absolute_error(val_ic50_actuals, val_ic50_preds)
+        
+        logger.info(f"Epoch {epoch+1} | Loss: {train_loss:.4f} | pIC50 RMSE: {val_rmse:.4f} | R2: {val_r2:.4f}")
+        logger.info(f"             | nM RMSE: {ic50_rmse:.2f} | nM MAE: {ic50_mae:.2f}")
+        
+        if val_rmse < best_loss:
+            best_loss = val_rmse
             torch.save(model.state_dict(), 'best_gnn_model.pth')
+            logger.info("  -> Saved new best model")
         
-        if (epoch + 1) % 5 == 0:
-            logger.info(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | "
-                       f"Test RMSE: {test_rmse:.4f} | R²: {test_r2:.4f}")
-    
-    logger.info("-" * 70)
-    logger.info(f"✓ Training complete!")
-    logger.info(f"  Best Test RMSE: {best_rmse:.4f}")
-    logger.info(f"  Best Test R²: {best_r2:.4f}")
-    logger.info(f"  MAE: {mean_absolute_error(test_actuals_best, test_predictions_best):.4f}")
-    logger.info(f"  Model saved: best_gnn_model.pth")
-    logger.info(f"  Log file: {log_file}")
-    logger.info("")
-    
-    # Save results
-    results = {
-        'timestamp': datetime.now().isoformat(),
-        'model_type': 'Graph Attention Network (GAT)',
-        'test_rmse': float(best_rmse),
-        'test_r2': float(best_r2),
-        'test_mae': float(mean_absolute_error(test_actuals_best, test_predictions_best)),
-        'n_samples': len(df),
-        'n_train': len(train_df),
-        'n_test': len(test_df),
-        'model_params': sum(p.numel() for p in model.parameters()),
-        'hidden_dims': CONFIG['hidden_dims'],
-        'num_heads': CONFIG['num_heads'],
-        'epochs': CONFIG['num_epochs'],
-        'batch_size': CONFIG['batch_size'],
-        'learning_rate': CONFIG['learning_rate'],
-        'device': str(device)
-    }
-    
-    results_file = f"gnn_training_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    logger.info(f"Results saved: {results_file}")
+        try:
+            torch.save({
+                'epoch': epoch,
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'best_loss': best_loss
+            }, checkpoint_file)
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     main()

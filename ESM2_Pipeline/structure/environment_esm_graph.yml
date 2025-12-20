@@ -1,0 +1,34 @@
+name: esm_graph
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  # Core PyTorch (Stable 2.5.1 with CUDA 12.4 support)
+  - pytorch=2.5.1
+  - pytorch-cuda=12.4
+  - torchaudio=2.5.1
+  - torchvision=0.20.1
+  
+  # Scientific computing
+  - numpy<2.0
+  - pandas
+  - scipy
+  
+  # Bio-specific
+  - biopython
+  - rdkit
+  
+  # Pip dependencies for PyG
+  - pip:
+    - torch-geometric
+    # We install the optimized scatter/sparse libs via pip with the specific wheel link
+    # to avoid compilation errors.
+    - pyg_lib -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
+    - torch_scatter -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
+    - torch_sparse -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
+    - torch_cluster -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
+    - torch_spline_conv -f https://data.pyg.org/whl/torch-2.5.1+cu124.html

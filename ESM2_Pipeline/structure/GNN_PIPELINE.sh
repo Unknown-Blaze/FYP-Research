@@ -19,8 +19,8 @@ cd "$STRUCTURE_DIR"
 echo "[Step 1/3] Checking PDB structures..."
 echo "------------------------------------------------------------"
 
-MHC_COUNT=$(ls data/generated_pdbs/mhc/*rank_001*.pdb 2>/dev/null | wc -l)
-PEP_COUNT=$(ls data/generated_pdbs/peptide/*rank_001*.pdb 2>/dev/null | wc -l)
+MHC_COUNT=$(find data/generated_pdbs/mhc -name "*_unrelaxed_rank_001_*.pdb" -type f 2>/dev/null | wc -l)
+PEP_COUNT=$(find data/generated_pdbs/peptide -name "pep_*_unrelaxed_rank_001_*.pdb" -type f 2>/dev/null | wc -l)
 
 echo "  MHC structures: $MHC_COUNT / 58"
 echo "  Peptide structures: $PEP_COUNT / 24483"
@@ -66,7 +66,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-python pdb_to_graphs.py \
+$COLABFOLD_PY pdb_to_graphs.py \
     --mhc-pdb-dir data/generated_pdbs/mhc \
     --peptide-pdb-dir data/generated_pdbs/peptide \
     --output-dir data/graphs \
@@ -77,8 +77,9 @@ echo ""
 # Step 3: Train GNN
 echo "[Step 3/3] Training Graph Neural Network..."
 echo "------------------------------------------------------------"
+echo "Using --resume to continue from checkpoint if available"
 
-python train_gnn_model.py
+$COLABFOLD_PY train_gnn_model.py --resume
 
 echo ""
 echo "============================================================"
