@@ -1,5 +1,6 @@
 """
 Graph Neural Network for MHC-Peptide Binding Affinity Prediction
+(Two-Tower Architecture - Optimized for Separate PDBs)
 """
 import warnings
 # Filter specific warnings to keep logs clean
@@ -25,7 +26,7 @@ import logging
 from datetime import datetime
 
 # Setup logging
-log_file = f"gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+log_file = f"./logs/gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -41,18 +42,18 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 CONFIG = {
-    'input_dim': 31,  # Matches your graph node features
+    'input_dim': 31,  # Matches your chemical feature size
     'dataset_path': '../iedb_dataset.csv',
     'graphs_dir_mhc': 'data/graphs/mhc',
     'graphs_dir_peptide': 'data/graphs/peptide',
     'mapping_file': 'row_to_pdb_map.json',
     'batch_size': 32,
     'num_epochs': 100,
-    'learning_rate': 0.0003,
-    'hidden_dims': [64, 64],
+    'learning_rate': 0.0001, # Optimized for Two-Tower
+    'hidden_dims': [128, 128],
     'num_heads': 4,
-    'dropout': 0.25,
-    'weight_decay': 1e-5,
+    'dropout': 0.3,
+    'weight_decay': 1e-4,
     'seed': 42,
     'grad_clip_norm': 1.0,
     'scheduler_factor': 0.5,
@@ -65,22 +66,45 @@ CONFIG = {
 # Dataset
 # ============================================================================
 
+import torch
+from torch_geometric.data import Data
+
+# Helper to create Radial Basis Function (RBF) features for distances
+def rbf_expansion(distances, num_centers=16, cutoff=10.0):
+    centers = torch.linspace(0, cutoff, num_centers, device=distances.device)
+    width = centers[1] - centers[0]
+    return torch.exp(-((distances.unsqueeze(-1) - centers) ** 2) / width)
+
 class GraphBindingDataset(Dataset):
     def __init__(self, df, mapping, graphs_dir_mhc, graphs_dir_peptide, cache_graphs: bool = False, label_col: str = 'IC50'):
         self.df = df.copy()
         self.mapping = mapping
         self.graphs_dir_mhc = Path(graphs_dir_mhc)
         self.graphs_dir_peptide = Path(graphs_dir_peptide)
-        self.cache_graphs = cache_graphs # Should be False for large datasets
+        self.cache_graphs = cache_graphs 
         self.label_col = label_col
         self.graph_cache = {}
 
         if self.cache_graphs:
             logger.info("Pre-caching enabled (Warning: High RAM usage)...")
-            # (Caching logic omitted for stability - sticking to Lazy Loading)
 
     def __len__(self):
         return len(self.df)
+
+    def _add_distance_features(self, graph):
+        # 1. Calculate Distances for existing edges
+        row, col = graph.edge_index
+        coord_diff = graph.pos[row] - graph.pos[col]
+        radial_dist = torch.norm(coord_diff, dim=-1)
+        
+        # 2. Encode distances using RBF (Soft one-hot encoding of distance)
+        edge_attr_dist = rbf_expansion(radial_dist, num_centers=16)
+        
+        # 3. Replace or Concatenate with existing edge_attr
+        # Assuming existing edge_attr encodes bond type (e.g., size 2-4)
+        # If your existing edge_attr is empty/zeros, just use dist
+        graph.edge_attr = edge_attr_dist 
+        return graph
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -95,7 +119,6 @@ class GraphBindingDataset(Dataset):
         # --- LOAD GRAPHS ---
         mhc_graph = None
         if mhc_id:
-            # Check cache first, then disk
             mhc_graph = self.graph_cache.get(mhc_id)
             if mhc_graph is None:
                 files = list(self.graphs_dir_mhc.glob(f"{mhc_id}*rank_001*.pt"))
@@ -124,24 +147,24 @@ class GraphBindingDataset(Dataset):
                 pos=torch.zeros((1, 3), dtype=torch.float32)
             )
 
-        # --- SAFETY CHECK (The Fix for KeyError: 'pos') ---
-        # Ensure 'pos' exists even if the loaded file didn't have it
+        # --- SAFETY CHECK: Features ---
         if not hasattr(mhc_graph, 'pos') or mhc_graph.pos is None:
             mhc_graph.pos = torch.zeros((mhc_graph.num_nodes, 3), dtype=torch.float32)
             
         if not hasattr(pep_graph, 'pos') or pep_graph.pos is None:
             pep_graph.pos = torch.zeros((pep_graph.num_nodes, 3), dtype=torch.float32)
 
-        # --- SAFETY CHECK: Ensure edge_attr exists and is correctly shaped ---
-        # Many PyG graphs may omit edge attributes; create zero features if missing
         if not hasattr(mhc_graph, 'edge_attr') or mhc_graph.edge_attr is None:
-            mhc_edges = mhc_graph.edge_index.shape[1] if hasattr(mhc_graph, 'edge_index') and mhc_graph.edge_index is not None else 0
-            mhc_graph.edge_attr = torch.zeros((mhc_edges, 2), dtype=torch.float32)
+            num_edges = mhc_graph.edge_index.shape[1] if mhc_graph.edge_index is not None else 0
+            mhc_graph.edge_attr = torch.zeros((num_edges, 2), dtype=torch.float32)
 
         if not hasattr(pep_graph, 'edge_attr') or pep_graph.edge_attr is None:
-            pep_edges = pep_graph.edge_index.shape[1] if hasattr(pep_graph, 'edge_index') and pep_graph.edge_index is not None else 0
-            pep_graph.edge_attr = torch.zeros((pep_edges, 2), dtype=torch.float32)
+            num_edges = pep_graph.edge_index.shape[1] if pep_graph.edge_index is not None else 0
+            pep_graph.edge_attr = torch.zeros((num_edges, 2), dtype=torch.float32)
 
+        mhc_graph = self._add_distance_features(mhc_graph)
+        pep_graph = self._add_distance_features(pep_graph)
+        
         # --- TARGET CALCULATION (pIC50) ---
         try:
             ic50_val = float(row[self.label_col])
@@ -154,88 +177,115 @@ class GraphBindingDataset(Dataset):
         return mhc_graph, pep_graph, float(target)
 
 # ============================================================================
-# GNN Model
+# SOTA GNN Model (Cross-Attention / Docking Architecture)
 # ============================================================================
 
 from torch_geometric.utils import to_dense_batch
 
+# --- CHANGE 1: Import GATv2Conv ---
+from torch_geometric.nn import GATv2Conv 
+
+# ============================================================================
+# SOTA GNN Model (Cross-Attention / Docking Architecture)
+# ============================================================================
+
+from torch_geometric.utils import to_dense_batch
+from torch_geometric.nn import GATv2Conv 
+
 class GraphAttentionNetwork(nn.Module):
-    def __init__(self, input_dim: int = 31, hidden_dims: list = [64, 64], 
-                 num_heads: int = 4, dropout: float = 0.2):
+    def __init__(self, input_dim: int = 31, hidden_dims: list = [128, 128], 
+                 num_heads: int = 4, dropout: float = 0.3):
         super().__init__()
         self.dropout = dropout
         
-        # 1. Shared GAT Layers (Process both graphs with same physics)
+        # 1. Intra-Molecular Graph Layers (GATv2)
         dims = [input_dim] + hidden_dims
         self.gat_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.input_norm = nn.BatchNorm1d(input_dim)
         
+        # Match this to your Dataset's RBF centers (You set num_centers=16)
+        EDGE_DIM = 16 
+        
         for i in range(len(dims) - 1):
             self.gat_layers.append(
-                GATConv(dims[i], dims[i+1] // num_heads, heads=num_heads, dropout=dropout)
+                GATv2Conv(
+                    in_channels=dims[i], 
+                    out_channels=dims[i+1] // num_heads, 
+                    heads=num_heads, 
+                    dropout=dropout, 
+                    edge_dim=EDGE_DIM,  # <--- CRITICAL: Uses your RBF distances
+                    add_self_loops=False
+                )
             )
             self.norms.append(nn.LayerNorm(dims[i+1]))
         
         self.graph_dim = dims[-1]
         
-        # 2. Global Pooling Interaction (The "Two-Tower" Logic)
-        # We concat Mean + Max pooling for both MHC and Peptide
-        # Size = (MHC_Mean + MHC_Max + Pep_Mean + Pep_Max) = 4 * Hidden
+        # 2. Inter-Molecular Cross-Attention (The Docking Step)
+        self.cross_attn_dim = self.graph_dim
+        self.mhc_to_pep_attn = nn.MultiheadAttention(self.cross_attn_dim, num_heads=4, batch_first=True, dropout=dropout)
+        self.pep_to_mhc_attn = nn.MultiheadAttention(self.cross_attn_dim, num_heads=4, batch_first=True, dropout=dropout)
+        
+        # 3. Prediction Head
         combined_dim = 4 * self.graph_dim
         
-        # 3. Interaction Head (MLP)
-        # We let the MLP figure out the non-linear "binding energy"
         self.fc_layers = nn.Sequential(
             nn.Linear(combined_dim, 256),
-            nn.BatchNorm1d(256), # Added BatchNorm for stability
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(dropout),
-            
             nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(dropout),
-            
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(64, 1)
+            nn.Linear(128, 1)
         )
     
-    def forward_graph(self, x, edge_index, edge_attr, batch):
-        # Normalize Input
+    def process_subgraph(self, x, edge_index, edge_attr, batch):
         x = self.input_norm(x)
-        
-        # Run GAT Layers
         for gat, norm in zip(self.gat_layers, self.norms):
             x_in = x
-            x = gat(x, edge_index, edge_attr)
+            # Pass the RBF edge attributes here
+            x = gat(x, edge_index, edge_attr=edge_attr)
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-            if x.shape == x_in.shape:
+            if x.shape[1] == x_in.shape[1]: 
                 x = x + x_in # Residual
             x = norm(x)
-            
-        # Global Pooling (Summarize the whole molecule)
-        if batch is None:
-            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-            
-        return torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], dim=1)
+        return x
 
     def forward(self, mhc, pep):
-        # 1. Get Global Summaries
-        mhc_vec = self.forward_graph(mhc.x, mhc.edge_index, mhc.edge_attr, mhc.batch)
-        pep_vec = self.forward_graph(pep.x, pep.edge_index, pep.edge_attr, pep.batch)
+        # STEP 1: Process Graphs Independently
+        mhc_feats = self.process_subgraph(mhc.x, mhc.edge_index, mhc.edge_attr, mhc.batch)
+        pep_feats = self.process_subgraph(pep.x, pep.edge_index, pep.edge_attr, pep.batch)
         
-        # 2. Combine (Concatenate)
-        # Note: Your old code multiplied (interaction = mhc * pep).
-        # Concatenation is generally safer for MLP to learn interactions itself.
-        combined = torch.cat([mhc_vec, pep_vec], dim=1)
+        # STEP 2: Dense Batching
+        mhc_dense, mhc_mask = to_dense_batch(mhc_feats, mhc.batch)
+        pep_dense, pep_mask = to_dense_batch(pep_feats, pep.batch)
         
-        # 3. Predict
+        # STEP 3: Cross-Attention (Docking)
+        # Peptide searches MHC
+        pep_ctx, _ = self.pep_to_mhc_attn(query=pep_dense, key=mhc_dense, value=mhc_dense, key_padding_mask=~mhc_mask)
+        # MHC searches Peptide
+        mhc_ctx, _ = self.mhc_to_pep_attn(query=mhc_dense, key=pep_dense, value=pep_dense, key_padding_mask=~pep_mask)
+        
+        # STEP 4: Smart Pooling
+        def masked_pool(tensor, mask):
+            tensor = tensor * mask.unsqueeze(-1).float()
+            summed = tensor.sum(dim=1)
+            counts = mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+            return summed / counts
+
+        combined = torch.cat([
+            masked_pool(mhc_dense, mhc_mask),
+            masked_pool(pep_dense, pep_mask),
+            masked_pool(mhc_ctx, mhc_mask),
+            masked_pool(pep_ctx, pep_mask)
+        ], dim=1)
+        
         return self.fc_layers(combined).squeeze()
+
 # ============================================================================
 # Training Logic
 # ============================================================================
@@ -246,15 +296,13 @@ def inverse_transform_pic50(pic50_values: np.ndarray) -> np.ndarray:
 def train_epoch(model, loader, optimizer, criterion, device, grad_clip_norm: float = 0.0):
     model.train()
     total_loss = 0
-    # Use enumerate to avoid crash if loader is empty
     for i, (mhc, pep, y) in enumerate(loader):
         mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
         optimizer.zero_grad()
         pred = model(mhc, pep)
         loss = criterion(pred, y.float())
         loss.backward()
-        # Gradient clipping for stability
-        if grad_clip_norm and grad_clip_norm > 0:
+        if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
         total_loss += loss.item()
@@ -277,7 +325,6 @@ def evaluate(model, loader, device):
     
     rmse = np.sqrt(mean_squared_error(actuals_arr, preds_arr))
     r2 = r2_score(actuals_arr, preds_arr)
-    
     ic50_preds = inverse_transform_pic50(preds_arr)
     ic50_actuals = inverse_transform_pic50(actuals_arr)
     
@@ -288,17 +335,14 @@ def main():
     parser.add_argument('--resume', action='store_true', help='Resume from last checkpoint')
     args = parser.parse_args()
     
-    # Set seeds for reproducibility
+    # Set seeds
     seed = CONFIG.get('seed', 42)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    try:
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    except Exception:
-        pass
 
     logger.info("Loading Data...")
     df = pd.read_csv(CONFIG['dataset_path'])
@@ -314,7 +358,6 @@ def main():
     
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
     
-    # Lazy Loading Enabled (cache_graphs=False)
     logger.info("Initializing datasets (Lazy Loading Mode)...")
     train_ds = GraphBindingDataset(train_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], 
                                    cache_graphs=False, label_col=label_col)
@@ -322,7 +365,6 @@ def main():
     test_ds = GraphBindingDataset(test_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], 
                                   cache_graphs=False, label_col=label_col)
     
-    # num_workers=4 speeds up disk reading
     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
     test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], num_workers=4)
     
@@ -331,13 +373,9 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG.get('weight_decay', 0))
     criterion = nn.MSELoss()
 
-    # LR Scheduler: ReduceLROnPlateau on validation RMSE
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=CONFIG.get('scheduler_factor', 0.5),
-        patience=CONFIG.get('scheduler_patience', 3),
-        min_lr=CONFIG.get('scheduler_min_lr', 1e-6)
+        optimizer, mode='min', factor=CONFIG.get('scheduler_factor', 0.5), 
+        patience=CONFIG.get('scheduler_patience', 3), min_lr=CONFIG.get('scheduler_min_lr', 1e-6)
     )
     
     logger.info(f"Starting training on {device}...")
@@ -368,9 +406,8 @@ def main():
         
         current_lr = optimizer.param_groups[0]['lr']
         logger.info(f"Epoch {epoch+1} | Loss: {train_loss:.4f} | pIC50 RMSE: {val_rmse:.4f} | R2: {val_r2:.4f} | LR: {current_lr:.2e}")
-        logger.info(f"             | nM RMSE: {ic50_rmse:.2f} | nM MAE: {ic50_mae:.2f}")
+        logger.info(f"              | nM RMSE: {ic50_rmse:.2f} | nM MAE: {ic50_mae:.2f}")
 
-        # Step scheduler with validation metric
         try:
             scheduler.step(val_rmse)
         except Exception:
@@ -379,7 +416,7 @@ def main():
         if val_rmse < best_loss:
             best_loss = val_rmse
             torch.save(model.state_dict(), 'best_gnn_model.pth')
-            logger.info("  -> Saved new best model")
+            logger.info("   -> Saved new best model")
         
         try:
             torch.save({
