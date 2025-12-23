@@ -1,0 +1,11 @@
+2025-12-23 20:29:49,368 - Loading model: facebook/esm2_t33_650M_UR50D...
+2025-12-23 20:29:49,368 - Configuration:
+2025-12-23 20:29:49,368 -   - Co-attention layers: 1
+2025-12-23 20:29:49,369 -   - Attention heads: 8
+2025-12-23 20:29:49,369 -   - ESM frozen: False
+2025-12-23 20:29:49,369 -   - Warm start gate: 0.1
+2025-12-23 20:29:50,741 -   ✓ Initialized GatedFusion with warm start (gate ≈ 0.10)
+2025-12-23 20:29:50,771 -   ✓ Initialized GatedFusion with warm start (gate ≈ 0.10)
+2025-12-23 20:29:51,042 -   ✓ Initialized AttentionPooling with near-uniform weights
+2025-12-23 20:29:51,057 -   ✓ Initialized AttentionPooling with near-uniform weights
+2025-12-23 20:29:51,186 - ✓ Model initialization complete with warm-start

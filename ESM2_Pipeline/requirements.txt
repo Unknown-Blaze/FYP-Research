@@ -21,3 +21,5 @@ numpy
 Pillow
 protobuf
 tensorflow-cpu
+tensorboard
+pydantic
