@@ -1,6 +1,6 @@
 """
 Graph Neural Network for MHC-Peptide Binding Affinity Prediction
-(Two-Tower Architecture - Optimized for Separate PDBs)
+(SOTA Cross-Attention Docking Architecture - GATv2 + RBF + Transformer)
 """
 import warnings
 # Filter specific warnings to keep logs clean
@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 # Correct Imports for PyG 2.0+
-from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
+from torch_geometric.utils import to_dense_batch
 from torch_geometric.loader import DataLoader 
 from torch_geometric.data import Data
 from torch.utils.data import Dataset
@@ -49,7 +50,7 @@ CONFIG = {
     'mapping_file': 'row_to_pdb_map.json',
     'batch_size': 32,
     'num_epochs': 100,
-    'learning_rate': 0.0001, # Optimized for Two-Tower
+    'learning_rate': 0.0001, # Optimized for Transformer/GATv2
     'hidden_dims': [128, 128],
     'num_heads': 4,
     'dropout': 0.3,
@@ -65,9 +66,6 @@ CONFIG = {
 # ============================================================================
 # Dataset
 # ============================================================================
-
-import torch
-from torch_geometric.data import Data
 
 # Helper to create Radial Basis Function (RBF) features for distances
 def rbf_expansion(distances, num_centers=16, cutoff=10.0):
@@ -98,11 +96,10 @@ class GraphBindingDataset(Dataset):
         radial_dist = torch.norm(coord_diff, dim=-1)
         
         # 2. Encode distances using RBF (Soft one-hot encoding of distance)
+        # Matches EDGE_DIM=16 in the model
         edge_attr_dist = rbf_expansion(radial_dist, num_centers=16)
         
-        # 3. Replace or Concatenate with existing edge_attr
-        # Assuming existing edge_attr encodes bond type (e.g., size 2-4)
-        # If your existing edge_attr is empty/zeros, just use dist
+        # 3. Assign to graph
         graph.edge_attr = edge_attr_dist 
         return graph
 
@@ -136,14 +133,14 @@ class GraphBindingDataset(Dataset):
             mhc_graph = Data(
                 x=torch.randn((1, CONFIG['input_dim']), dtype=torch.float32) * 0.01, 
                 edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 2), dtype=torch.float32),
+                edge_attr=torch.zeros((0, 16), dtype=torch.float32), # Match RBF dim
                 pos=torch.zeros((1, 3), dtype=torch.float32)
             )
         if pep_graph is None:
             pep_graph = Data(
                 x=torch.randn((1, CONFIG['input_dim']), dtype=torch.float32) * 0.01, 
                 edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 2), dtype=torch.float32),
+                edge_attr=torch.zeros((0, 16), dtype=torch.float32), # Match RBF dim
                 pos=torch.zeros((1, 3), dtype=torch.float32)
             )
 
@@ -154,14 +151,7 @@ class GraphBindingDataset(Dataset):
         if not hasattr(pep_graph, 'pos') or pep_graph.pos is None:
             pep_graph.pos = torch.zeros((pep_graph.num_nodes, 3), dtype=torch.float32)
 
-        if not hasattr(mhc_graph, 'edge_attr') or mhc_graph.edge_attr is None:
-            num_edges = mhc_graph.edge_index.shape[1] if mhc_graph.edge_index is not None else 0
-            mhc_graph.edge_attr = torch.zeros((num_edges, 2), dtype=torch.float32)
-
-        if not hasattr(pep_graph, 'edge_attr') or pep_graph.edge_attr is None:
-            num_edges = pep_graph.edge_index.shape[1] if pep_graph.edge_index is not None else 0
-            pep_graph.edge_attr = torch.zeros((num_edges, 2), dtype=torch.float32)
-
+        # Inject RBF Edge Features
         mhc_graph = self._add_distance_features(mhc_graph)
         pep_graph = self._add_distance_features(pep_graph)
         
@@ -180,18 +170,6 @@ class GraphBindingDataset(Dataset):
 # SOTA GNN Model (Cross-Attention / Docking Architecture)
 # ============================================================================
 
-from torch_geometric.utils import to_dense_batch
-
-# --- CHANGE 1: Import GATv2Conv ---
-from torch_geometric.nn import GATv2Conv 
-
-# ============================================================================
-# SOTA GNN Model (Cross-Attention / Docking Architecture)
-# ============================================================================
-
-from torch_geometric.utils import to_dense_batch
-from torch_geometric.nn import GATv2Conv 
-
 class GraphAttentionNetwork(nn.Module):
     def __init__(self, input_dim: int = 31, hidden_dims: list = [128, 128], 
                  num_heads: int = 4, dropout: float = 0.3):
@@ -204,7 +182,7 @@ class GraphAttentionNetwork(nn.Module):
         self.norms = nn.ModuleList()
         self.input_norm = nn.BatchNorm1d(input_dim)
         
-        # Match this to your Dataset's RBF centers (You set num_centers=16)
+        # Match this to your Dataset's RBF centers (num_centers=16)
         EDGE_DIM = 16 
         
         for i in range(len(dims) - 1):
@@ -214,7 +192,7 @@ class GraphAttentionNetwork(nn.Module):
                     out_channels=dims[i+1] // num_heads, 
                     heads=num_heads, 
                     dropout=dropout, 
-                    edge_dim=EDGE_DIM,  # <--- CRITICAL: Uses your RBF distances
+                    edge_dim=EDGE_DIM,  # <--- CRITICAL: Uses RBF distances
                     add_self_loops=False
                 )
             )
@@ -250,8 +228,9 @@ class GraphAttentionNetwork(nn.Module):
             x = gat(x, edge_index, edge_attr=edge_attr)
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
+            # Residual connection (projection if shapes match)
             if x.shape[1] == x_in.shape[1]: 
-                x = x + x_in # Residual
+                x = x + x_in 
             x = norm(x)
         return x
 
@@ -260,7 +239,7 @@ class GraphAttentionNetwork(nn.Module):
         mhc_feats = self.process_subgraph(mhc.x, mhc.edge_index, mhc.edge_attr, mhc.batch)
         pep_feats = self.process_subgraph(pep.x, pep.edge_index, pep.edge_attr, pep.batch)
         
-        # STEP 2: Dense Batching
+        # STEP 2: Dense Batching (Sparse -> Dense)
         mhc_dense, mhc_mask = to_dense_batch(mhc_feats, mhc.batch)
         pep_dense, pep_mask = to_dense_batch(pep_feats, pep.batch)
         
