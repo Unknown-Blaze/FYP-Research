@@ -8,6 +8,7 @@ warnings.filterwarnings("ignore")
 
 import pandas as pd
 import numpy as np
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,15 +20,28 @@ from torch.utils.data import Dataset
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
+from scipy.stats import pearsonr, spearmanr
 import logging
 from datetime import datetime
 import sys
+import json
+from tqdm import tqdm  # <--- NEW: For progress bars
 
-# Setup logging
+# ============================================================================
+# 0. Global Setup & Logging
+# ============================================================================
+
+# Toggle this for professional experiment tracking
+USE_WANDB = False 
+
+if USE_WANDB:
+    import wandb
+
 log_file = f"gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 logging.basicConfig(
     level=logging.INFO, 
-    format='%(asctime)s - %(message)s',
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.FileHandler(log_file),
         logging.StreamHandler(sys.stdout)
@@ -36,7 +50,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# 1. Configuration (A100 POWER MODE)
+# 1. Configuration (A100 TUNED)
 # ============================================================================
 
 CONFIG = {
@@ -46,23 +60,23 @@ CONFIG = {
     'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
     
     # --- A100 OPTIMIZATIONS ---
-    'batch_size': 128,        # Increased from 32 to 128 (A100 has huge VRAM)
-    'num_epochs': 150,        # Give it more time to converge
-    'learning_rate': 0.0001,  # Standard start, Scheduler will refine it
+    'batch_size': 1024,           
+    'num_epochs': 150,        
+    'learning_rate': 3e-4,        
+    'warmup_epochs': 10,          
     
-    # --- ARCHITECTURE: "STRONG" ---
-    'hidden_dims': [512, 512, 512],  # Deep & Wide: 3 layers of 512
-    'num_heads': 16,                 # High-resolution attention
-    # ------------------------------
-    
-    'dropout': 0.2,           # Slightly reduced dropout for deeper model
-    'weight_decay': 1e-5,
+    # --- ARCHITECTURE ---
+    'hidden_dims': [512, 512, 512],
+    'num_heads': 16,                
+    'dropout': 0.3,               
+    'weight_decay': 1e-4,         
     'seed': 42,
+    'grad_clip_norm': 1.0,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
 # ============================================================================
-# 2. Dataset 
+# 2. Dataset & Helper Functions
 # ============================================================================
 
 def rbf_expansion(distances, num_centers=16, cutoff=10.0):
@@ -75,6 +89,8 @@ class EnsembleDataset(Dataset):
         self.df = df.copy()
         self.graphs_dir_mhc = Path(graphs_dir_mhc)
         self.graphs_dir_peptide = Path(graphs_dir_peptide)
+        
+        # Smart label detection
         if label_col not in self.df.columns and 'IC50' in self.df.columns:
             self.label_col = 'IC50'
         else:
@@ -104,22 +120,22 @@ class EnsembleDataset(Dataset):
             pep_path = self.graphs_dir_peptide / file_id
             
             mhc_g, pep_g = None, None
-            if mhc_path.exists() and pep_path.exists():
-                try:
-                    mhc_g = torch.load(mhc_path)
-                    pep_g = torch.load(pep_path)
-                    mhc_g = self._add_distance_features(mhc_g)
-                    pep_g = self._add_distance_features(pep_g)
-                except:
-                    pass
+            try:
+                mhc_g = torch.load(mhc_path)
+                pep_g = torch.load(pep_path)
+                mhc_g = self._add_distance_features(mhc_g)
+                pep_g = self._add_distance_features(pep_g)
+            except (FileNotFoundError, Exception):
+                pass
 
             if mhc_g is None or pep_g is None:
+                # Optimized dummy generation
                 dummy_x = torch.zeros((1, CONFIG['input_dim']), dtype=torch.float32)
                 dummy_pos = torch.zeros((1, 3), dtype=torch.float32)
                 dummy_edge = torch.zeros((2, 0), dtype=torch.long)
                 dummy_attr = torch.zeros((0, 16), dtype=torch.float32)
                 mhc_g = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, edge_attr=dummy_attr)
-                pep_g = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, edge_attr=dummy_attr, y=torch.tensor([0.0]))
+                pep_g = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, edge_attr=dummy_attr)
 
             mhc_list.append(mhc_g)
             pep_list.append(pep_g)
@@ -130,7 +146,7 @@ class EnsembleDataset(Dataset):
         try:
             val = float(row[self.label_col])
             val = min(val, 50000.0)
-            target = -np.log10(val * 1e-9 + 1e-12)
+            target = -np.log10(val * 1e-9 + 1e-12) 
         except:
             target = 0.0
 
@@ -150,11 +166,11 @@ class MultiHeadAttentionFusion(nn.Module):
     def forward(self, template_embeddings):
         batch_size = template_embeddings.size(0)
         query = self.query_token.expand(batch_size, -1, -1)
-        attn_output, weights = self.attn(query, template_embeddings, template_embeddings)
+        attn_output, _ = self.attn(query, template_embeddings, template_embeddings)
         return self.norm(attn_output + query).squeeze(1)
 
 class EnsembleGraphNetwork(nn.Module):
-    def __init__(self, input_dim=23, hidden_dims=[512, 512, 512], num_heads=16, dropout=0.2):
+    def __init__(self, input_dim=23, hidden_dims=[512, 512, 512], num_heads=16, dropout=0.3):
         super().__init__()
         self.dropout = dropout
         dims = [input_dim] + hidden_dims
@@ -170,7 +186,6 @@ class EnsembleGraphNetwork(nn.Module):
             
         self.graph_dim = dims[-1]
         
-        # Inter-molecule Attention
         self.mhc_to_pep_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
         self.pep_to_mhc_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
         
@@ -191,9 +206,14 @@ class EnsembleGraphNetwork(nn.Module):
             x_in = x
             if edge_index.numel() > 0:
                 x = gat(x, edge_index, edge_attr=edge_attr)
-            x = F.elu(x)
-            if x.shape[1] == x_in.shape[1]: x = x + x_in 
+            
+            # Residual if shapes match
+            if x.shape[1] == x_in.shape[1]: 
+                x = x + x_in 
+            
             x = norm(x)
+            x = F.elu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
         return x
 
     def forward(self, mhc, pep):
@@ -216,6 +236,7 @@ class EnsembleGraphNetwork(nn.Module):
             masked_pool(pep_ctx, pep_mask)
         ], dim=1)
         
+        # Reshape for fusion (Batch * 4 -> Batch, 4, Feats)
         actual_batch_size = combined.shape[0] // 4
         templates_view = combined.view(actual_batch_size, 4, -1)
         fused_vec = self.fusion_module(templates_view)
@@ -223,29 +244,44 @@ class EnsembleGraphNetwork(nn.Module):
         return self.fc_layers(fused_vec).squeeze()
 
 # ============================================================================
-# 4. Main Loop
+# 4. Optimized Training Loop
 # ============================================================================
 
-def train_epoch(model, loader, optimizer, criterion, device):
+def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_clip_norm):
     model.train()
     total_loss = 0
-    for i, (mhc, pep, y) in enumerate(loader):
+    
+    # NEW: TQDM Progress Bar
+    pbar = tqdm(loader, desc="Training", leave=False, dynamic_ncols=True)
+    
+    for mhc, pep, y in pbar:
         mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
-        optimizer.zero_grad()
-        pred = model(mhc, pep)
-        loss = criterion(pred, y.float())
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            pred = model(mhc, pep)
+            loss = criterion(pred, y.float())
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        
         total_loss += loss.item()
         
-        if i % 50 == 0: # Log more frequently given the larger batch size
-            logger.info(f"   Step {i}/{len(loader)} | Batch Loss: {loss.item():.4f}")
+        # Update progress bar with current loss
+        pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+        
+        if USE_WANDB:
+            wandb.log({"train_step_loss": loss.item()})
 
     return total_loss / len(loader) if len(loader) > 0 else 0
 
 def evaluate(model, loader, device):
     model.eval()
     preds, actuals = [], []
+    
     with torch.no_grad():
         for mhc, pep, y in loader:
             mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
@@ -253,26 +289,60 @@ def evaluate(model, loader, device):
             preds.extend(pred.cpu().numpy())
             actuals.extend(y.cpu().numpy())
     
-    if not preds: return 0, 0
-    return np.sqrt(mean_squared_error(actuals, preds)), r2_score(actuals, preds)
+    if not preds: return 0, 0, 0, 0
+    
+    preds = np.array(preds)
+    actuals = np.array(actuals)
+    
+    rmse = np.sqrt(mean_squared_error(actuals, preds))
+    r2 = r2_score(actuals, preds)
+    pcc, _ = pearsonr(actuals, preds)
+    scc, _ = spearmanr(actuals, preds)
+    
+    return rmse, r2, pcc, scc
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 def main():
-    logger.info("Loading Data...")
+    # --- Reproducibility Setup ---
+    seed = CONFIG['seed']
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True 
+    g_seed = torch.Generator()
+    g_seed.manual_seed(seed)
+
+    if USE_WANDB:
+        wandb.init(project="MHC-GNN-Ensemble", config=CONFIG, name=f"run_{datetime.now().strftime('%m%d_%H%M')}")
+
+    logger.info("Initializing Data...")
     df = pd.read_csv(CONFIG['dataset_path'])
     label_col = 'binding_affinity_nM' if 'binding_affinity_nM' in df.columns else 'IC50'
     df = df.dropna(subset=[label_col])
     
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=CONFIG['seed'])
+    train_df, test_df = train_test_split(df, test_size=0.15, random_state=CONFIG['seed'])
     train_ds = EnsembleDataset(train_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     test_ds = EnsembleDataset(test_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     
-    # Increased workers for faster A100 data feeding
-    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=8)
-    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], num_workers=8)
+    logger.info(f"Train Size: {len(train_df)} | Test Size: {len(test_df)}")
+    
+    train_loader = DataLoader(
+        train_ds, batch_size=CONFIG['batch_size'], shuffle=True, 
+        num_workers=8, pin_memory=True, persistent_workers=True,
+        worker_init_fn=seed_worker, generator=g_seed 
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=CONFIG['batch_size'], num_workers=8, 
+        pin_memory=True, persistent_workers=True,
+        worker_init_fn=seed_worker, generator=g_seed
+    )
     
     device = torch.device(CONFIG['device'])
-    
-    # MODEL INIT (512-dim, 16-heads)
     model = EnsembleGraphNetwork(
         input_dim=CONFIG['input_dim'],
         hidden_dims=CONFIG['hidden_dims'], 
@@ -280,32 +350,100 @@ def main():
         dropout=CONFIG['dropout']
     ).to(device)
     
-    # NEW CHECKPOINT FILE FOR A100 MODEL
-    checkpoint_path = "gnn_a100_optimized.pth" 
-    
-    if Path(checkpoint_path).exists():
-        logger.info(f"✅ FOUND CHECKPOINT. Loading weights from {checkpoint_path}...")
-        model.load_state_dict(torch.load(checkpoint_path))
-    else:
-        logger.info("🚀 Starting FRESH training on A100 (512-dim, 16-heads)...")
+    checkpoint_best = "gnn_a100_best.pth"
+    checkpoint_last = "gnn_a100_last.pth"
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
-    criterion = nn.MSELoss()
+    scaler = torch.amp.GradScaler('cuda')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
+    criterion = nn.HuberLoss(delta=1.0) 
     
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    def lr_lambda(epoch):
+        if epoch < CONFIG['warmup_epochs']:
+            return float(epoch + 1) / float(CONFIG['warmup_epochs'])
+        return 1.0
+
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True
     )
 
-    logger.info("Starting training...")
-    for epoch in range(CONFIG['num_epochs']):
-        current_lr = optimizer.param_groups[0]['lr']
-        loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_rmse, val_r2 = evaluate(model, test_loader, device)
-        
-        scheduler.step(val_rmse**2)
+    # --- RESUMPTION LOGIC ---
+    start_epoch = 0
+    best_val_rmse = float('inf')
+    early_stop_counter = 0
 
-        logger.info(f"Epoch {epoch+1}: LR {current_lr:.6f} | Loss {loss:.4f} | Val RMSE {val_rmse:.4f} | Val R2 {val_r2:.4f}")
-        torch.save(model.state_dict(), checkpoint_path)
+    if Path(checkpoint_last).exists():
+        logger.info(f"🔄 Found checkpoint: {checkpoint_last}. Resuming...")
+        checkpoint = torch.load(checkpoint_last)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        if 'plateau_scheduler' in checkpoint:
+            plateau_scheduler.load_state_dict(checkpoint['plateau_scheduler'])
+        
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_rmse = checkpoint.get('best_val_rmse', float('inf'))
+        early_stop_counter = checkpoint.get('early_stop_counter', 0)
+        
+        # Fast-forward warmup
+        if start_epoch > CONFIG['warmup_epochs']:
+            for _ in range(CONFIG['warmup_epochs']): warmup_scheduler.step()
+        
+        logger.info(f"⏩ Resumed at Epoch {start_epoch} (Best RMSE: {best_val_rmse:.4f})")
+    else:
+        logger.info("🚀 Starting FRESH training on A100...")
+
+    patience = 20
+
+    for epoch in range(start_epoch, CONFIG['num_epochs']):
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        loss = train_epoch_amp(model, train_loader, optimizer, criterion, device, scaler, CONFIG['grad_clip_norm'])
+        val_rmse, val_r2, val_pcc, val_scc = evaluate(model, test_loader, device)
+        
+        if epoch < CONFIG['warmup_epochs']:
+            warmup_scheduler.step()
+        else:
+            plateau_scheduler.step(val_rmse)
+
+        # Clean Log Line
+        log_msg = (f"Ep {epoch+1:03d} | LR {current_lr:.2e} | Train Loss {loss:.4f} | "
+                   f"Val RMSE {val_rmse:.4f} | Val R2 {val_r2:.4f} | Val PCC {val_pcc:.4f}")
+        logger.info(log_msg)
+        
+        if USE_WANDB:
+            wandb.log({
+                "epoch": epoch+1, "lr": current_lr, "train_loss": loss,
+                "val_rmse": val_rmse, "val_r2": val_r2, "val_pcc": val_pcc, "val_scc": val_scc
+            })
+
+        # Save Logic
+        state_dict = {
+            'epoch': epoch,
+            'config': CONFIG, # <--- CRITICAL: SAVE CONFIG FOR INFERENCE
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'plateau_scheduler': plateau_scheduler.state_dict(),
+            'best_val_rmse': best_val_rmse,
+            'early_stop_counter': early_stop_counter
+        }
+
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            early_stop_counter = 0
+            torch.save(state_dict, checkpoint_best) # Save best with full state (safe)
+            logger.info(f"⭐ New Best Model Saved")
+        else:
+            early_stop_counter += 1
+            logger.info(f"⏳ Patience: {early_stop_counter}/{patience}")
+
+        torch.save(state_dict, checkpoint_last)
+
+        if early_stop_counter >= patience:
+            logger.info("🛑 Early Stopping Triggered.")
+            break
 
 if __name__ == '__main__':
     main()
