@@ -14,8 +14,13 @@ torch.set_float32_matmul_precision('high')
 # ==========================================================
 INPUT_CSV = "../iedb_dataset.csv"
 OUTPUT_DIR = Path("data/generated_pdbs/complexes")
-# Standard Human Beta-2 Microglobulin
+
+# Human Beta-2 Microglobulin
 B2M_SEQ = "IQRTPKIQVYSRHPAENGKSNFLNCYVSGFHPSDIEVDLLKNGERIEKVEHSDLSFSKDWSFYLLYYTEFTPTEKDEYACRVNHVTLSQPKIVKWDRDM"
+
+# GOLDEN STANDARD LINKER: (GGGGS)x3
+# Stable enough to fold, flexible enough to dock.
+LINKER_SEQ = "GGGGSGGGGSGGGGS" 
 # ==========================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -36,12 +41,14 @@ def save_reordered_pdb(coords, plddt_scores, full_seq, len_pep, len_b2m, len_mhc
     """
     
     # Calculate RANGES in the folded sequence
-    # 1. Peptide
+    # 1. Peptide (Start)
     range_pep = (0, len_pep)
-    # 2. B2M (starts after Pep + Linker)
+    
+    # 2. B2M (Middle)
     start_b2m = len_pep + linker_len
     range_b2m = (start_b2m, start_b2m + len_b2m)
-    # 3. MHC (starts after Pep + Linker + B2M + Linker)
+    
+    # 3. MHC (End)
     start_mhc = start_b2m + len_b2m + linker_len
     range_mhc = (start_mhc, start_mhc + len_mhc)
 
@@ -51,15 +58,15 @@ def save_reordered_pdb(coords, plddt_scores, full_seq, len_pep, len_b2m, len_mhc
     with open(filename, 'w') as f:
         atom_serial = 1
         
-        def write_segment(start_idx, end_idx, chain_id, residue_offset=0):
+        def write_segment(start_idx, end_idx, chain_id):
             nonlocal atom_serial
             for i in range(start_idx, end_idx):
                 if i >= coords.shape[0]: break
                 
                 aa = full_seq[i]
                 res_name = aa_map.get(aa, 'UNK')
-                # Recalculate residue ID (relative to the chain start, 1-based)
-                res_id = (i - start_idx) + 1 + residue_offset
+                # Residue ID restarts at 1 for each chain
+                res_id = (i - start_idx) + 1
                 
                 raw_score = float(plddt_scores[i, 1]) if plddt_scores.ndim == 2 else float(plddt_scores[i])
                 b_factor = raw_score * 100.0
@@ -76,13 +83,13 @@ def save_reordered_pdb(coords, plddt_scores, full_seq, len_pep, len_b2m, len_mhc
 
         # --- WRITE IN STANDARD PDB ORDER ---
         
-        # 1. Chain A: MHC (Extracted from the END of the folded sequence)
+        # 1. Chain A: MHC (From end of tensor)
         write_segment(range_mhc[0], range_mhc[1], 'A')
         
-        # 2. Chain B: Peptide (Extracted from the START of the folded sequence)
+        # 2. Chain B: Peptide (From start of tensor)
         write_segment(range_pep[0], range_pep[1], 'B')
         
-        # 3. Chain C: B2M (Extracted from the MIDDLE)
+        # 3. Chain C: B2M (From middle of tensor)
         write_segment(range_b2m[0], range_b2m[1], 'C')
         
         f.write("TER\n")
@@ -114,20 +121,16 @@ def main():
         pep = row['peptide'].strip().upper()
         cid = row['complex_id']
         
-        # --- KEY CHANGE: SINGLE CHAIN TRIMER ORDER ---
+        # --- SCT TOPOLOGY ---
         # Lab standard: Pep -> Linker -> B2M -> Linker -> MHC
-        
-        LINKER_LEN = 20 # 20 Glycines is optimal for this geometry
-        linker = "G" * LINKER_LEN
-        
-        # Construct Sequence
-        full_seq = pep + linker + B2M_SEQ + linker + mhc
+        full_seq = pep + LINKER_SEQ + B2M_SEQ + LINKER_SEQ + mhc
         
         len_pep = len(pep)
         len_b2m = len(B2M_SEQ)
         len_mhc = len(mhc)
+        len_linker = len(LINKER_SEQ)
 
-        # CONTINUOUS POSITIONS (Crucial: Tricking model to think it's one protein)
+        # CONTINUOUS POSITIONS
         position_ids = torch.arange(len(full_seq), dtype=torch.long).unsqueeze(0).to(device)
 
         try:
@@ -145,7 +148,7 @@ def main():
             # Save while unscrambling the order
             save_reordered_pdb(
                 cleaned_coords, plddt, full_seq, 
-                len_pep, len_b2m, len_mhc, LINKER_LEN, 
+                len_pep, len_b2m, len_mhc, len_linker, 
                 out_path
             )
             

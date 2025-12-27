@@ -1,38 +1,36 @@
 import torch
-import os
-from torch_geometric.data import Data
+from pathlib import Path
 
-# Paths to your output
-mhc_path = "data/graphs/mhc"
-pep_path = "data/graphs/peptide"
+# CONFIG
+GRAPH_DIR = Path("data/graphs/threaded")
 
-def check_graph(folder, name):
-    files = [f for f in os.listdir(folder) if f.endswith('.pt')]
-    if not files:
-        print(f"No .pt files found in {folder}")
+def main():
+    # 1. Check if files exist
+    mhc_files = list((GRAPH_DIR / "mhc").glob("*.pt"))
+    pep_files = list((GRAPH_DIR / "peptide").glob("*.pt"))
+    
+    if not mhc_files:
+        print("❌ No MHC graphs found! Did the generator run?")
         return
 
-    # Load the first file found
-    file_path = os.path.join(folder, files[0])
-    data = torch.load(file_path)
-    
-    print(f"\n--- Inspecting {name} Graph: {files[0]} ---")
-    print(f"Keys: {data.keys}")
-    print(f"Number of nodes: {data.num_nodes}")
-    print(f"Number of edges: {data.num_edges}")
-    
-    # Check for specific features
-    if hasattr(data, 'x') and data.x is not None:
-        print(f"Node Features (x) shape: {data.x.shape} (Num Nodes x Features)")
-    else:
-        print("WARNING: No node features ('x') found!")
+    print(f"✅ Found {len(mhc_files)} MHC graphs and {len(pep_files)} Peptide graphs.")
 
-    if hasattr(data, 'edge_index') and data.edge_index is not None:
-        print(f"Edge Index shape: {data.edge_index.shape}")
-        
-    if hasattr(data, 'pos') and data.pos is not None:
-        print(f"3D Coordinates (pos) shape: {data.pos.shape}")
+    # 2. Inspect the first MHC graph
+    print("\n--- Inspecting First MHC Graph ---")
+    mhc_data = torch.load(mhc_files[0])
+    print(f"File: {mhc_files[0].name}")
+    print(f"Node Features (X) Shape: {mhc_data.x.shape}  <-- Should be (NumResidues, 22)")
+    print(f"Positions (Pos) Shape:   {mhc_data.pos.shape} <-- Should be (NumResidues, 3)")
+    print(f"Edges (Edge Index):      {mhc_data.edge_index.shape}")
+    
+    # 3. Inspect the first Peptide graph
+    print("\n--- Inspecting First Peptide Graph ---")
+    pep_data = torch.load(pep_files[0])
+    print(f"File: {pep_files[0].name}")
+    print(f"Node Features (X) Shape: {pep_data.x.shape}  <-- Should be (9, 22)")
+    print(f"Target (y):              {pep_data.y}         <-- Should be a pIC50 float")
 
-# Run checks
-check_graph(mhc_path, "MHC")
-check_graph(pep_path, "Peptide")
+    print("\n✅ READY FOR GNN TRAINING")
+
+if __name__ == "__main__":
+    main()

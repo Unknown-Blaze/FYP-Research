@@ -1,222 +1,177 @@
 """
 Graph Neural Network for MHC-Peptide Binding Affinity Prediction
-(SOTA Cross-Attention Docking Architecture - GATv2 + RBF + Transformer)
+(Multi-Template Ensemble Architecture - MIL-GNN)
 """
 import warnings
-# Filter specific warnings to keep logs clean
-warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
+warnings.filterwarnings("ignore")
 
 import pandas as pd
 import numpy as np
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# Correct Imports for PyG 2.0+
-from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import to_dense_batch
 from torch_geometric.loader import DataLoader 
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch 
 from torch.utils.data import Dataset
 from pathlib import Path
-import json
-import argparse
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, r2_score
 import logging
 from datetime import datetime
+import sys
 
-# Setup logging
-log_file = f"./logs/gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+# Setup logging - Tries to force immediate flush
+log_file = f"gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, 
     format='%(asctime)s - %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout) # Explicitly log to console too
     ]
 )
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration
+# 1. Configuration 
 # ============================================================================
 
 CONFIG = {
-    'input_dim': 31,  # Matches your chemical feature size
+    'input_dim': 23,  
     'dataset_path': '../iedb_dataset.csv',
-    'graphs_dir_mhc': 'data/graphs/mhc',
-    'graphs_dir_peptide': 'data/graphs/peptide',
-    'mapping_file': 'row_to_pdb_map.json',
+    'graphs_dir_mhc': 'data/graphs/ensemble/mhc',
+    'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
     'batch_size': 32,
     'num_epochs': 100,
-    'learning_rate': 0.0001, # Optimized for Transformer/GATv2
+    'learning_rate': 0.00005,
     'hidden_dims': [128, 128],
     'num_heads': 4,
     'dropout': 0.3,
     'weight_decay': 1e-4,
     'seed': 42,
-    'grad_clip_norm': 1.0,
-    'scheduler_factor': 0.5,
-    'scheduler_patience': 3,
-    'scheduler_min_lr': 1e-6,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
 # ============================================================================
-# Dataset
+# 2. Dataset 
 # ============================================================================
 
-# Helper to create Radial Basis Function (RBF) features for distances
 def rbf_expansion(distances, num_centers=16, cutoff=10.0):
     centers = torch.linspace(0, cutoff, num_centers, device=distances.device)
     width = centers[1] - centers[0]
     return torch.exp(-((distances.unsqueeze(-1) - centers) ** 2) / width)
 
-class GraphBindingDataset(Dataset):
-    def __init__(self, df, mapping, graphs_dir_mhc, graphs_dir_peptide, cache_graphs: bool = False, label_col: str = 'IC50'):
+class EnsembleDataset(Dataset):
+    def __init__(self, df, graphs_dir_mhc, graphs_dir_peptide, label_col='binding_affinity_nM'):
         self.df = df.copy()
-        self.mapping = mapping
         self.graphs_dir_mhc = Path(graphs_dir_mhc)
         self.graphs_dir_peptide = Path(graphs_dir_peptide)
-        self.cache_graphs = cache_graphs 
-        self.label_col = label_col
-        self.graph_cache = {}
-
-        if self.cache_graphs:
-            logger.info("Pre-caching enabled (Warning: High RAM usage)...")
+        if label_col not in self.df.columns and 'IC50' in self.df.columns:
+            self.label_col = 'IC50'
+        else:
+            self.label_col = label_col
 
     def __len__(self):
         return len(self.df)
 
     def _add_distance_features(self, graph):
-        # 1. Calculate Distances for existing edges
-        row, col = graph.edge_index
-        coord_diff = graph.pos[row] - graph.pos[col]
-        radial_dist = torch.norm(coord_diff, dim=-1)
-        
-        # 2. Encode distances using RBF (Soft one-hot encoding of distance)
-        # Matches EDGE_DIM=16 in the model
-        edge_attr_dist = rbf_expansion(radial_dist, num_centers=16)
-        
-        # 3. Assign to graph
-        graph.edge_attr = edge_attr_dist 
+        if graph.edge_index.numel() > 0:
+            row, col = graph.edge_index
+            coord_diff = graph.pos[row] - graph.pos[col]
+            radial_dist = torch.norm(coord_diff, dim=-1)
+            graph.edge_attr = rbf_expansion(radial_dist, num_centers=16)
+        else:
+            graph.edge_attr = torch.zeros((0, 16), dtype=torch.float32)
         return graph
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        key = str(row.name) 
+        mhc_list = []
+        pep_list = []
         
-        mhc_id, pep_id = None, None
-        
-        if key in self.mapping:
-            mhc_id = self.mapping[key]['mhc_pdb_id']
-            pep_id = self.mapping[key]['peptide_pdb_id']
-        
-        # --- LOAD GRAPHS ---
-        mhc_graph = None
-        if mhc_id:
-            mhc_graph = self.graph_cache.get(mhc_id)
-            if mhc_graph is None:
-                files = list(self.graphs_dir_mhc.glob(f"{mhc_id}*rank_001*.pt"))
-                if files: mhc_graph = torch.load(files[0])
-        
-        pep_graph = None
-        if pep_id:
-            pep_graph = self.graph_cache.get(pep_id)
-            if pep_graph is None:
-                files = list(self.graphs_dir_peptide.glob(f"{pep_id}*rank_001*.pt"))
-                if files: pep_graph = torch.load(files[0])
-
-        # --- DUMMY FALLBACK ---
-        if mhc_graph is None:
-            mhc_graph = Data(
-                x=torch.randn((1, CONFIG['input_dim']), dtype=torch.float32) * 0.01, 
-                edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 16), dtype=torch.float32), # Match RBF dim
-                pos=torch.zeros((1, 3), dtype=torch.float32)
-            )
-        if pep_graph is None:
-            pep_graph = Data(
-                x=torch.randn((1, CONFIG['input_dim']), dtype=torch.float32) * 0.01, 
-                edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 16), dtype=torch.float32), # Match RBF dim
-                pos=torch.zeros((1, 3), dtype=torch.float32)
-            )
-
-        # --- SAFETY CHECK: Features ---
-        if not hasattr(mhc_graph, 'pos') or mhc_graph.pos is None:
-            mhc_graph.pos = torch.zeros((mhc_graph.num_nodes, 3), dtype=torch.float32)
+        for t in range(4):
+            file_id = f"{row.name}_T{t}.pt"
+            mhc_path = self.graphs_dir_mhc / file_id
+            pep_path = self.graphs_dir_peptide / file_id
             
-        if not hasattr(pep_graph, 'pos') or pep_graph.pos is None:
-            pep_graph.pos = torch.zeros((pep_graph.num_nodes, 3), dtype=torch.float32)
+            mhc_g, pep_g = None, None
+            if mhc_path.exists() and pep_path.exists():
+                try:
+                    mhc_g = torch.load(mhc_path)
+                    pep_g = torch.load(pep_path)
+                    mhc_g = self._add_distance_features(mhc_g)
+                    pep_g = self._add_distance_features(pep_g)
+                except:
+                    pass
 
-        # Inject RBF Edge Features
-        mhc_graph = self._add_distance_features(mhc_graph)
-        pep_graph = self._add_distance_features(pep_graph)
-        
-        # --- TARGET CALCULATION (pIC50) ---
+            if mhc_g is None or pep_g is None:
+                dummy_x = torch.zeros((1, CONFIG['input_dim']), dtype=torch.float32)
+                dummy_pos = torch.zeros((1, 3), dtype=torch.float32)
+                dummy_edge = torch.zeros((2, 0), dtype=torch.long)
+                dummy_attr = torch.zeros((0, 16), dtype=torch.float32)
+                mhc_g = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, edge_attr=dummy_attr)
+                pep_g = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, edge_attr=dummy_attr, y=torch.tensor([0.0]))
+
+            mhc_list.append(mhc_g)
+            pep_list.append(pep_g)
+
+        mhc_batch = Batch.from_data_list(mhc_list)
+        pep_batch = Batch.from_data_list(pep_list)
+
         try:
-            ic50_val = float(row[self.label_col])
-            ic50_clamped = min(ic50_val, 50000.0)
-            molar = ic50_clamped * 1e-9
-            target = -np.log10(molar + 1e-12)
-        except Exception:
+            val = float(row[self.label_col])
+            val = min(val, 50000.0)
+            target = -np.log10(val * 1e-9 + 1e-12)
+        except:
             target = 0.0
-        
-        return mhc_graph, pep_graph, float(target)
+
+        return mhc_batch, pep_batch, float(target)
 
 # ============================================================================
-# SOTA GNN Model (Cross-Attention / Docking Architecture)
+# 3. Model
 # ============================================================================
 
-class GraphAttentionNetwork(nn.Module):
-    def __init__(self, input_dim: int = 31, hidden_dims: list = [128, 128], 
-                 num_heads: int = 4, dropout: float = 0.3):
+class MultiHeadAttentionFusion(nn.Module):
+    def __init__(self, hidden_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.query_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, template_embeddings):
+        batch_size = template_embeddings.size(0)
+        query = self.query_token.expand(batch_size, -1, -1)
+        attn_output, weights = self.attn(query, template_embeddings, template_embeddings)
+        return self.norm(attn_output + query).squeeze(1)
+
+class EnsembleGraphNetwork(nn.Module):
+    def __init__(self, input_dim=23, hidden_dims=[128, 128], num_heads=4, dropout=0.3):
         super().__init__()
         self.dropout = dropout
-        
-        # 1. Intra-Molecular Graph Layers (GATv2)
         dims = [input_dim] + hidden_dims
         self.gat_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.input_norm = nn.BatchNorm1d(input_dim)
         
-        # Match this to your Dataset's RBF centers (num_centers=16)
-        EDGE_DIM = 16 
-        
         for i in range(len(dims) - 1):
             self.gat_layers.append(
-                GATv2Conv(
-                    in_channels=dims[i], 
-                    out_channels=dims[i+1] // num_heads, 
-                    heads=num_heads, 
-                    dropout=dropout, 
-                    edge_dim=EDGE_DIM,  # <--- CRITICAL: Uses RBF distances
-                    add_self_loops=False
-                )
+                GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, dropout=dropout, edge_dim=16)
             )
             self.norms.append(nn.LayerNorm(dims[i+1]))
-        
+            
         self.graph_dim = dims[-1]
-        
-        # 2. Inter-Molecular Cross-Attention (The Docking Step)
-        self.cross_attn_dim = self.graph_dim
-        self.mhc_to_pep_attn = nn.MultiheadAttention(self.cross_attn_dim, num_heads=4, batch_first=True, dropout=dropout)
-        self.pep_to_mhc_attn = nn.MultiheadAttention(self.cross_attn_dim, num_heads=4, batch_first=True, dropout=dropout)
-        
-        # 3. Prediction Head
-        combined_dim = 4 * self.graph_dim
+        self.mhc_to_pep_attn = nn.MultiheadAttention(self.graph_dim, num_heads=4, batch_first=True, dropout=dropout)
+        self.pep_to_mhc_attn = nn.MultiheadAttention(self.graph_dim, num_heads=4, batch_first=True, dropout=dropout)
+        self.embedding_dim = 4 * self.graph_dim
+        self.fusion_module = MultiHeadAttentionFusion(self.embedding_dim, num_heads=4)
         
         self.fc_layers = nn.Sequential(
-            nn.Linear(combined_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Linear(self.embedding_dim, 256),
+            nn.LayerNorm(256), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(128, 1)
         )
     
@@ -224,37 +179,25 @@ class GraphAttentionNetwork(nn.Module):
         x = self.input_norm(x)
         for gat, norm in zip(self.gat_layers, self.norms):
             x_in = x
-            # Pass the RBF edge attributes here
-            x = gat(x, edge_index, edge_attr=edge_attr)
+            if edge_index.numel() > 0:
+                x = gat(x, edge_index, edge_attr=edge_attr)
             x = F.elu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            # Residual connection (projection if shapes match)
-            if x.shape[1] == x_in.shape[1]: 
-                x = x + x_in 
+            if x.shape[1] == x_in.shape[1]: x = x + x_in 
             x = norm(x)
         return x
 
     def forward(self, mhc, pep):
-        # STEP 1: Process Graphs Independently
         mhc_feats = self.process_subgraph(mhc.x, mhc.edge_index, mhc.edge_attr, mhc.batch)
         pep_feats = self.process_subgraph(pep.x, pep.edge_index, pep.edge_attr, pep.batch)
         
-        # STEP 2: Dense Batching (Sparse -> Dense)
         mhc_dense, mhc_mask = to_dense_batch(mhc_feats, mhc.batch)
         pep_dense, pep_mask = to_dense_batch(pep_feats, pep.batch)
         
-        # STEP 3: Cross-Attention (Docking)
-        # Peptide searches MHC
-        pep_ctx, _ = self.pep_to_mhc_attn(query=pep_dense, key=mhc_dense, value=mhc_dense, key_padding_mask=~mhc_mask)
-        # MHC searches Peptide
-        mhc_ctx, _ = self.mhc_to_pep_attn(query=mhc_dense, key=pep_dense, value=pep_dense, key_padding_mask=~pep_mask)
+        pep_ctx, _ = self.pep_to_mhc_attn(pep_dense, mhc_dense, mhc_dense, key_padding_mask=~mhc_mask)
+        mhc_ctx, _ = self.mhc_to_pep_attn(mhc_dense, pep_dense, pep_dense, key_padding_mask=~pep_mask)
         
-        # STEP 4: Smart Pooling
         def masked_pool(tensor, mask):
-            tensor = tensor * mask.unsqueeze(-1).float()
-            summed = tensor.sum(dim=1)
-            counts = mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
-            return summed / counts
+            return (tensor * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
 
         combined = torch.cat([
             masked_pool(mhc_dense, mhc_mask),
@@ -263,16 +206,17 @@ class GraphAttentionNetwork(nn.Module):
             masked_pool(pep_ctx, pep_mask)
         ], dim=1)
         
-        return self.fc_layers(combined).squeeze()
+        actual_batch_size = combined.shape[0] // 4
+        templates_view = combined.view(actual_batch_size, 4, -1)
+        fused_vec = self.fusion_module(templates_view)
+        
+        return self.fc_layers(fused_vec).squeeze()
 
 # ============================================================================
-# Training Logic
+# 4. Main Loop
 # ============================================================================
 
-def inverse_transform_pic50(pic50_values: np.ndarray) -> np.ndarray:
-    return 10.0 ** (9.0 - pic50_values)
-
-def train_epoch(model, loader, optimizer, criterion, device, grad_clip_norm: float = 0.0):
+def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
     for i, (mhc, pep, y) in enumerate(loader):
@@ -281,10 +225,13 @@ def train_epoch(model, loader, optimizer, criterion, device, grad_clip_norm: flo
         pred = model(mhc, pep)
         loss = criterion(pred, y.float())
         loss.backward()
-        if grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
         total_loss += loss.item()
+        
+        # --- LOG PROGRESS EVERY 100 STEPS ---
+        if i % 100 == 0:
+            logger.info(f"   Step {i}/{len(loader)} | Batch Loss: {loss.item():.4f}")
+
     return total_loss / len(loader) if len(loader) > 0 else 0
 
 def evaluate(model, loader, device):
@@ -297,116 +244,64 @@ def evaluate(model, loader, device):
             preds.extend(pred.cpu().numpy())
             actuals.extend(y.cpu().numpy())
     
-    if not preds: return 0, 0, [], [], [], []
-
-    preds_arr = np.array(preds)
-    actuals_arr = np.array(actuals)
-    
-    rmse = np.sqrt(mean_squared_error(actuals_arr, preds_arr))
-    r2 = r2_score(actuals_arr, preds_arr)
-    ic50_preds = inverse_transform_pic50(preds_arr)
-    ic50_actuals = inverse_transform_pic50(actuals_arr)
-    
-    return rmse, r2, preds_arr, actuals_arr, ic50_preds, ic50_actuals
+    if not preds: return 0, 0
+    return np.sqrt(mean_squared_error(actuals, preds)), r2_score(actuals, preds)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--resume', action='store_true', help='Resume from last checkpoint')
-    args = parser.parse_args()
-    
-    # Set seeds
-    seed = CONFIG.get('seed', 42)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-
     logger.info("Loading Data...")
     df = pd.read_csv(CONFIG['dataset_path'])
-    
-    label_cols = ['IC50', 'ic50', 'binding_affinity_nM']
-    label_col = next((c for c in label_cols if c in df.columns), None)
-    if not label_col: raise KeyError("No IC50 column found")
-    
-    df[label_col] = pd.to_numeric(df[label_col], errors='coerce')
+    label_col = 'binding_affinity_nM' if 'binding_affinity_nM' in df.columns else 'IC50'
     df = df.dropna(subset=[label_col])
     
-    with open(CONFIG['mapping_file']) as f: mapping = json.load(f)
-    
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-    
-    logger.info("Initializing datasets (Lazy Loading Mode)...")
-    train_ds = GraphBindingDataset(train_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], 
-                                   cache_graphs=False, label_col=label_col)
-    
-    test_ds = GraphBindingDataset(test_df, mapping, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], 
-                                  cache_graphs=False, label_col=label_col)
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=CONFIG['seed'])
+    train_ds = EnsembleDataset(train_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
+    test_ds = EnsembleDataset(test_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     
     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
     test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], num_workers=4)
     
     device = torch.device(CONFIG['device'])
-    model = GraphAttentionNetwork(input_dim=CONFIG['input_dim']).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG.get('weight_decay', 0))
+    model = EnsembleGraphNetwork(input_dim=CONFIG['input_dim']).to(device)
+    
+    # --- RESUME LOGIC ---
+    checkpoint_path = "gnn_ensemble_latest.pth"
+    if Path(checkpoint_path).exists():
+        logger.info(f"✅ FOUND CHECKPOINT. Loading weights from {checkpoint_path}...")
+        try:
+            model.load_state_dict(torch.load(checkpoint_path))
+            logger.info("✅ Weights loaded successfully. Resuming training...")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not load checkpoint: {e}. Starting from scratch.")
+    else:
+        logger.info("⚠️ No checkpoint found. Starting fresh.")
+    # --------------------
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
     criterion = nn.MSELoss()
-
+    
+    # --- NEW: ADD SCHEDULER ---
+    # Monitors 'val_loss'. If it doesn't improve for 3 epochs, it cuts LR by half.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=CONFIG.get('scheduler_factor', 0.5), 
-        patience=CONFIG.get('scheduler_patience', 3), min_lr=CONFIG.get('scheduler_min_lr', 1e-6)
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
     )
-    
-    logger.info(f"Starting training on {device}...")
-    
-    best_loss = float('inf')
-    start_epoch = 0
-    checkpoint_file = Path('gnn_last_checkpoint.pth')
-    
-    if args.resume and checkpoint_file.exists():
-        try:
-            ckpt = torch.load(checkpoint_file, map_location=device)
-            model.load_state_dict(ckpt['model_state'])
-            optimizer.load_state_dict(ckpt['optimizer_state'])
-            start_epoch = ckpt['epoch'] + 1
-            best_loss = ckpt['best_loss']
-            if 'scheduler_state' in ckpt:
-                scheduler.load_state_dict(ckpt['scheduler_state'])
-            logger.info(f"Resumed from epoch {start_epoch}")
-        except Exception:
-            start_epoch = 0
-    
-    for epoch in range(start_epoch, CONFIG['num_epochs']):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, grad_clip_norm=CONFIG.get('grad_clip_norm', 0.0))
-        val_rmse, val_r2, val_preds, val_actuals, val_ic50_preds, val_ic50_actuals = evaluate(model, test_loader, device)
-        
-        ic50_rmse = np.sqrt(mean_squared_error(val_ic50_actuals, val_ic50_preds))
-        ic50_mae = mean_absolute_error(val_ic50_actuals, val_ic50_preds)
-        
-        current_lr = optimizer.param_groups[0]['lr']
-        logger.info(f"Epoch {epoch+1} | Loss: {train_loss:.4f} | pIC50 RMSE: {val_rmse:.4f} | R2: {val_r2:.4f} | LR: {current_lr:.2e}")
-        logger.info(f"              | nM RMSE: {ic50_rmse:.2f} | nM MAE: {ic50_mae:.2f}")
+    # --------------------------
 
-        try:
-            scheduler.step(val_rmse)
-        except Exception:
-            pass
+    logger.info("Starting training...")
+    for epoch in range(CONFIG['num_epochs']):
+        # Get current LR for logging
+        current_lr = optimizer.param_groups[0]['lr']
         
-        if val_rmse < best_loss:
-            best_loss = val_rmse
-            torch.save(model.state_dict(), 'best_gnn_model.pth')
-            logger.info("   -> Saved new best model")
+        loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_rmse, val_r2 = evaluate(model, test_loader, device)
         
-        try:
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'optimizer_state': optimizer.state_dict(),
-                'best_loss': best_loss,
-                'scheduler_state': scheduler.state_dict()
-            }, checkpoint_file)
-        except Exception:
-            pass
+        # Calculate Validation Loss for the Scheduler (Approximation using RMSE^2)
+        val_loss = val_rmse**2
+        
+        # Update Scheduler
+        scheduler.step(val_loss)
+
+        logger.info(f"Epoch {epoch+1}: LR {current_lr:.6f} | Loss {loss:.4f} | Val RMSE {val_rmse:.4f} | Val R2 {val_r2:.4f}")
+        torch.save(model.state_dict(), "gnn_ensemble_latest.pth")
 
 if __name__ == '__main__':
     main()
