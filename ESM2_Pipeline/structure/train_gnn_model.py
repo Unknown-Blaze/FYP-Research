@@ -1,6 +1,7 @@
 """
 Graph Neural Network for MHC-Peptide Binding Affinity Prediction
 (Multi-Template Ensemble Architecture - MIL-GNN)
+TARGET: NVIDIA A100 OPTIMIZED (512-dim, 16 heads)
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -22,20 +23,20 @@ import logging
 from datetime import datetime
 import sys
 
-# Setup logging - Tries to force immediate flush
+# Setup logging
 log_file = f"gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler(sys.stdout) # Explicitly log to console too
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# 1. Configuration 
+# 1. Configuration (A100 POWER MODE)
 # ============================================================================
 
 CONFIG = {
@@ -43,13 +44,19 @@ CONFIG = {
     'dataset_path': '../iedb_dataset.csv',
     'graphs_dir_mhc': 'data/graphs/ensemble/mhc',
     'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
-    'batch_size': 32,
-    'num_epochs': 100,
-    'learning_rate': 0.00005,
-    'hidden_dims': [128, 128],
-    'num_heads': 4,
-    'dropout': 0.3,
-    'weight_decay': 1e-4,
+    
+    # --- A100 OPTIMIZATIONS ---
+    'batch_size': 128,        # Increased from 32 to 128 (A100 has huge VRAM)
+    'num_epochs': 150,        # Give it more time to converge
+    'learning_rate': 0.0001,  # Standard start, Scheduler will refine it
+    
+    # --- ARCHITECTURE: "STRONG" ---
+    'hidden_dims': [512, 512, 512],  # Deep & Wide: 3 layers of 512
+    'num_heads': 16,                 # High-resolution attention
+    # ------------------------------
+    
+    'dropout': 0.2,           # Slightly reduced dropout for deeper model
+    'weight_decay': 1e-5,
     'seed': 42,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
@@ -147,7 +154,7 @@ class MultiHeadAttentionFusion(nn.Module):
         return self.norm(attn_output + query).squeeze(1)
 
 class EnsembleGraphNetwork(nn.Module):
-    def __init__(self, input_dim=23, hidden_dims=[128, 128], num_heads=4, dropout=0.3):
+    def __init__(self, input_dim=23, hidden_dims=[512, 512, 512], num_heads=16, dropout=0.2):
         super().__init__()
         self.dropout = dropout
         dims = [input_dim] + hidden_dims
@@ -162,17 +169,20 @@ class EnsembleGraphNetwork(nn.Module):
             self.norms.append(nn.LayerNorm(dims[i+1]))
             
         self.graph_dim = dims[-1]
-        self.mhc_to_pep_attn = nn.MultiheadAttention(self.graph_dim, num_heads=4, batch_first=True, dropout=dropout)
-        self.pep_to_mhc_attn = nn.MultiheadAttention(self.graph_dim, num_heads=4, batch_first=True, dropout=dropout)
+        
+        # Inter-molecule Attention
+        self.mhc_to_pep_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
+        self.pep_to_mhc_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
+        
         self.embedding_dim = 4 * self.graph_dim
-        self.fusion_module = MultiHeadAttentionFusion(self.embedding_dim, num_heads=4)
+        self.fusion_module = MultiHeadAttentionFusion(self.embedding_dim, num_heads=num_heads)
         
         self.fc_layers = nn.Sequential(
-            nn.Linear(self.embedding_dim, 256),
-            nn.LayerNorm(256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(128, 1)
+            nn.Linear(self.embedding_dim, 1024),
+            nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(1024, 512),
+            nn.LayerNorm(512), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(512, 1)
         )
     
     def process_subgraph(self, x, edge_index, edge_attr, batch):
@@ -228,8 +238,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
         optimizer.step()
         total_loss += loss.item()
         
-        # --- LOG PROGRESS EVERY 100 STEPS ---
-        if i % 100 == 0:
+        if i % 50 == 0: # Log more frequently given the larger batch size
             logger.info(f"   Step {i}/{len(loader)} | Batch Loss: {loss.item():.4f}")
 
     return total_loss / len(loader) if len(loader) > 0 else 0
@@ -257,51 +266,46 @@ def main():
     train_ds = EnsembleDataset(train_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     test_ds = EnsembleDataset(test_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     
-    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], num_workers=4)
+    # Increased workers for faster A100 data feeding
+    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=8)
+    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], num_workers=8)
     
     device = torch.device(CONFIG['device'])
-    model = EnsembleGraphNetwork(input_dim=CONFIG['input_dim']).to(device)
     
-    # --- RESUME LOGIC ---
-    checkpoint_path = "gnn_ensemble_latest.pth"
+    # MODEL INIT (512-dim, 16-heads)
+    model = EnsembleGraphNetwork(
+        input_dim=CONFIG['input_dim'],
+        hidden_dims=CONFIG['hidden_dims'], 
+        num_heads=CONFIG['num_heads'],
+        dropout=CONFIG['dropout']
+    ).to(device)
+    
+    # NEW CHECKPOINT FILE FOR A100 MODEL
+    checkpoint_path = "gnn_a100_optimized.pth" 
+    
     if Path(checkpoint_path).exists():
         logger.info(f"✅ FOUND CHECKPOINT. Loading weights from {checkpoint_path}...")
-        try:
-            model.load_state_dict(torch.load(checkpoint_path))
-            logger.info("✅ Weights loaded successfully. Resuming training...")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not load checkpoint: {e}. Starting from scratch.")
+        model.load_state_dict(torch.load(checkpoint_path))
     else:
-        logger.info("⚠️ No checkpoint found. Starting fresh.")
-    # --------------------
+        logger.info("🚀 Starting FRESH training on A100 (512-dim, 16-heads)...")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
     criterion = nn.MSELoss()
     
-    # --- NEW: ADD SCHEDULER ---
-    # Monitors 'val_loss'. If it doesn't improve for 3 epochs, it cuts LR by half.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3, verbose=True
     )
-    # --------------------------
 
     logger.info("Starting training...")
     for epoch in range(CONFIG['num_epochs']):
-        # Get current LR for logging
         current_lr = optimizer.param_groups[0]['lr']
-        
         loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_rmse, val_r2 = evaluate(model, test_loader, device)
         
-        # Calculate Validation Loss for the Scheduler (Approximation using RMSE^2)
-        val_loss = val_rmse**2
-        
-        # Update Scheduler
-        scheduler.step(val_loss)
+        scheduler.step(val_rmse**2)
 
         logger.info(f"Epoch {epoch+1}: LR {current_lr:.6f} | Loss {loss:.4f} | Val RMSE {val_rmse:.4f} | Val R2 {val_r2:.4f}")
-        torch.save(model.state_dict(), "gnn_ensemble_latest.pth")
+        torch.save(model.state_dict(), checkpoint_path)
 
 if __name__ == '__main__':
     main()
