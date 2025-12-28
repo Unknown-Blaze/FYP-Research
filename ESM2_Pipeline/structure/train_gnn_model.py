@@ -61,7 +61,8 @@ CONFIG = {
     'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
     
     # --- A100 OPTIMIZATIONS ---
-    'batch_size': 512,           
+    'batch_size': 128,
+    'grad_accum_steps': 4,          
     'num_epochs': 150,        
     'learning_rate': 3e-4,        
     'warmup_epochs': 10,          
@@ -256,32 +257,52 @@ def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_cl
     model.train()
     total_loss = 0
     
-    # NEW: TQDM Progress Bar
+    # Initialize optimizer
+    optimizer.zero_grad(set_to_none=True)
+    
     pbar = tqdm(loader, desc="Training", leave=False, dynamic_ncols=True)
     
-    for mhc, pep, y in pbar:
+    # Accumulation counter
+    accum_steps = CONFIG.get('grad_accum_steps', 1)
+    
+    for i, (mhc, pep, y) in enumerate(pbar):
         mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
-        optimizer.zero_grad(set_to_none=True)
         
+        # 1. Forward Pass
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             pred = model(mhc, pep)
             loss = criterion(pred, y.float())
+            
+            # Normalize loss for accumulation
+            loss = loss / accum_steps
         
+        # 2. Backward Pass (Accumulate Gradients)
         scaler.scale(loss).backward()
+        
+        # 3. Optimizer Step (Only every 'accum_steps' iterations)
+        if (i + 1) % accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        
+        # Track total loss (multiply back to get real loss value for logging)
+        total_loss += loss.item() * accum_steps
+        pbar.set_postfix({'loss': f"{loss.item() * accum_steps:.4f}"})
+        
+        if USE_WANDB:
+            wandb.log({"train_step_loss": loss.item() * accum_steps})
+
+    # Handle remaining gradients if total batches isn't divisible by accum_steps
+    if (i + 1) % accum_steps != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         scaler.step(optimizer)
         scaler.update()
-        
-        total_loss += loss.item()
-        
-        # Update progress bar with current loss
-        pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-        
-        if USE_WANDB:
-            wandb.log({"train_step_loss": loss.item()})
+        optimizer.zero_grad(set_to_none=True)
 
-    return total_loss / len(loader) if len(loader) > 0 else 0
+    return total_loss / len(loader)
 
 def evaluate(model, loader, device):
     model.eval()

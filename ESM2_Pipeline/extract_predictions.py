@@ -10,11 +10,13 @@ import yaml
 import json
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch, Data
 from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import to_dense_batch
 
-# --- 1. DEFINITIONS (MUST MATCH TRAINING) ---
+# ============================================================================
+# 1. MODEL DEFINITIONS (Must match your Training Script)
+# ============================================================================
 class MultiHeadAttentionFusion(nn.Module):
     def __init__(self, hidden_dim, num_heads=4, dropout=0.1):
         super().__init__()
@@ -74,33 +76,39 @@ class EnsembleGraphNetwork(nn.Module):
         fused = self.fusion_module(combined.view(-1, 4, combined.shape[-1]))
         return self.fc_layers(fused).squeeze()
 
-# --- 2. CONFIGURATION ---
+# ============================================================================
+# 2. CONFIGURATION
+# ============================================================================
 CONFIG = {
     'data_path': './iedb_dataset.csv', 
     'output_csv': 'ensemble_meta_data.csv',
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'batch_size': 256, 
     
+    # Batch size can be larger for inference since no gradients are stored
+    'batch_size': 128, 
+    
+    # Model Paths
     'esm_ckpt': 'checkpoints/checkpoints_esm2_warmstart/best_model.pt',
     'esm_config': 'sequence/config.yaml',
     'esm_scaler': 'checkpoints/checkpoints_esm2_warmstart/label_scaler.joblib',
     
-    'gnn_ckpt': 'gnn_a100_best.pth',
-    'gnn_mapping': './structure/row_to_pdb_map.json',
-    'gnn_mhc': 'data/graphs/ensemble/mhc',
-    'gnn_pep': 'data/graphs/ensemble/peptide'
+    'gnn_ckpt': './structure/gnn_a100_best.pth',
+    'gnn_mhc': './structure/data/graphs/ensemble/mhc',
+    'gnn_pep': './structure/data/graphs/ensemble/peptide'
 }
 
-# --- 3. IMPORTS AND LOADING ---
+# ============================================================================
+# 3. SETUP & IMPORTS
+# ============================================================================
 sys.path.append(os.path.join(os.getcwd(), 'sequence'))
 sys.path.append(os.path.join(os.getcwd(), 'structure'))
 
 try:
     from train_finetune import ESM2FineTuneModel, AppConfig
-    from train_gnn_model import EnsembleDataset  # Fixed: was GraphBindingDataset
+    # We need the Dataset class from your training script
+    from train_gnn_model import EnsembleDataset
 except ImportError as e:
     print(f"❌ IMPORTS FAILED: {e}")
-    print("Ensure 'sequence/' and 'structure/' folders exist and contain train_finetune.py / train_gnn_model.py")
     sys.exit(1)
 
 def load_models(device):
@@ -123,40 +131,40 @@ def load_models(device):
     # 2. ESM Scaler
     try:
         scaler = joblib.load(CONFIG['esm_scaler'])
-        # NOTE: Standard unscaling is typically y_real = y_pred * scale + min
+        # If your scaler was MinMax/Standard, unscaling is typically: pred * scale + min
         scaler_min = torch.tensor(scaler.min_[0], device=device) if hasattr(scaler, 'min_') else 0.0
         scaler_scale = torch.tensor(scaler.scale_[0], device=device) if hasattr(scaler, 'scale_') else 1.0
-        print("✅ Scaler Loaded.")
     except:
-        print("⚠️ Scaler NOT found, using identity.")
         scaler_min, scaler_scale = 0.0, 1.0
 
-    # 3. GNN Model (Dynamic Load)
+    # 3. GNN Model
     print(f"⏳ Loading GNN from {CONFIG['gnn_ckpt']}...")
     ckpt = torch.load(CONFIG['gnn_ckpt'], map_location=device)
     
-    # Check if config is saved in checkpoint (from our new training script)
+    # Attempt to load saved config from checkpoint
     saved_conf = ckpt.get('config', None)
     if saved_conf:
-        print(f"✅ Found saved config in checkpoint. Hidden Dims: {saved_conf['hidden_dims']}")
+        print(f"✅ Found saved config. Hidden Dims: {saved_conf['hidden_dims']}")
         gnn_model = EnsembleGraphNetwork(
             input_dim=saved_conf['input_dim'],
             hidden_dims=saved_conf['hidden_dims'], 
             num_heads=saved_conf['num_heads'],
-            dropout=0.0 # Inference dropout
+            dropout=0.0 # No dropout for inference
         ).to(device)
     else:
-        print("⚠️ No config found in checkpoint. Using hardcoded defaults.")
-        gnn_model = EnsembleGraphNetwork(hidden_dims=[512, 512, 512], num_heads=16, dropout=0.0).to(device)
+        print("⚠️ No config found. Using defaults.")
+        gnn_model = EnsembleGraphNetwork().to(device)
 
-    # Handle state dict structure
+    # Load weights
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
     gnn_model.load_state_dict(state)
     gnn_model.eval()
     
     return esm_model, gnn_model, tokenizer, scaler_min, scaler_scale
 
-# --- 4. DATASET HELPER ---
+# ============================================================================
+# 4. INFERENCE DATASET & COLLATE FIX
+# ============================================================================
 class InferenceDataset(Dataset):
     def __init__(self, df, gnn_ds, tokenizer):
         self.df = df
@@ -165,23 +173,34 @@ class InferenceDataset(Dataset):
     def __len__(self): return len(self.df)
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        # Get graph data (returns Batch, Batch, target)
         mhc_graph, pep_graph, target = self.gnn_ds[idx]
+        
         mhc_seq = row['mhc_sequence'] 
         pep_seq = row['peptide'] 
-        # Return pLDDT if column exists, else 0
         plddt = row.get('mean_plddt', 0.0) 
         if pd.isna(plddt): plddt = 0.0
+        
         return mhc_seq, pep_seq, mhc_graph, pep_graph, target, len(pep_seq), float(plddt)
 
 def collate_wrapper(batch, tokenizer):
-    mhc_seqs, pep_seqs, mhc_graphs, pep_graphs, targets, lens, plddts = zip(*batch)
+    # Unpack the list of tuples
+    mhc_seqs, pep_seqs, mhc_graphs_list, pep_graphs_list, targets, lens, plddts = zip(*batch)
+    
+    # Tokenize Sequences
     mhc_tok = tokenizer(list(mhc_seqs), return_tensors='pt', padding='max_length', max_length=512, truncation=True)
     pep_tok = tokenizer(list(pep_seqs), return_tensors='pt', padding='max_length', max_length=512, truncation=True)
-    # Note: mhc_graphs and pep_graphs are already Batch objects (4 templates each from EnsembleDataset)
-    # Just pass them through as-is; the model handles Batch inputs
-    return mhc_tok, pep_tok, mhc_graphs, pep_graphs, torch.tensor(targets), lens, plddts
+    
+    # --- CRITICAL FIX: Re-batch the graphs ---
+    # Convert tuple of Batch objects -> Single Super-Batch object
+    mhc_batch_graph = Batch.from_data_list(list(mhc_graphs_list))
+    pep_batch_graph = Batch.from_data_list(list(pep_graphs_list))
+    
+    return mhc_tok, pep_tok, mhc_batch_graph, pep_batch_graph, torch.tensor(targets), lens, plddts
 
-# --- 5. MAIN ---
+# ============================================================================
+# 5. MAIN EXECUTION
+# ============================================================================
 def main():
     device = torch.device(CONFIG['device'])
     esm_model, gnn_model, tokenizer, s_min, s_scale = load_models(device)
@@ -189,14 +208,18 @@ def main():
     print("⏳ Reading CSV...")
     df = pd.read_csv(CONFIG['data_path']).dropna(subset=['mhc_sequence', 'peptide'])
     
-    with open(CONFIG['gnn_mapping']) as f: mapping = json.load(f)
-    # Fixed: EnsembleDataset does NOT use mapping (it loads by index)
+    # Initialize GNN Dataset
     gnn_ds = EnsembleDataset(df, CONFIG['gnn_mhc'], CONFIG['gnn_pep'], label_col='binding_affinity_nM')
     
+    # Inference Loader
     dataset = InferenceDataset(df, gnn_ds, tokenizer)
     loader = DataLoader(
-        dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=8, # Reduced workers slightly for stability
-        collate_fn=lambda x: collate_wrapper(x, tokenizer), pin_memory=True
+        dataset, 
+        batch_size=CONFIG['batch_size'], 
+        shuffle=False, 
+        num_workers=4, 
+        collate_fn=lambda x: collate_wrapper(x, tokenizer),
+        pin_memory=True
     )
     
     results = []
@@ -205,25 +228,27 @@ def main():
     for batch in tqdm(loader):
         try:
             mhc_tok, pep_tok, mhc_graph, pep_graph, targets, lens, plddts = batch
+            
+            # Move to device
             esm_batch_mhc = {k: v.to(device) for k, v in mhc_tok.items()}
             esm_batch_pep = {k: v.to(device) for k, v in pep_tok.items()}
             mhc_graph = mhc_graph.to(device)
             pep_graph = pep_graph.to(device)
             
             with torch.no_grad():
-                # ESM Inference & Unscaling
+                # 1. ESM Prediction
                 esm_raw = esm_model(esm_batch_mhc, esm_batch_pep)
-                # Unscale: StandardScaler formula is (raw * scale) + min_
-                # This assumes ESM output is standardized; scale is std dev
                 esm_pred = esm_raw * s_scale + s_min 
                 
-                # GNN Inference (Already in pIC50/log space due to HuberLoss training)
+                # 2. GNN Prediction
                 gnn_pred = gnn_model(mhc_graph, pep_graph)
             
+            # Convert to CPU lists
             esm_vals = esm_pred.squeeze().cpu().tolist()
             gnn_vals = gnn_pred.squeeze().cpu().tolist()
             target_vals = targets.tolist()
             
+            # Handle single-item batches
             if not isinstance(esm_vals, list): esm_vals = [esm_vals]
             if not isinstance(gnn_vals, list): gnn_vals = [gnn_vals]
             
@@ -234,7 +259,6 @@ def main():
                     'actual_pic50': target_vals[i],
                     'peptide_len': lens[i],
                     'plddt': plddts[i],
-                    # Diff is only valid if both are in roughly the same unit (e.g. pIC50)
                     'diff': abs(esm_vals[i] - gnn_vals[i])
                 })
                 
@@ -242,6 +266,7 @@ def main():
             print(f"⚠️ Batch Error: {e}")
             continue
 
+    # Save Results
     pd.DataFrame(results).to_csv(CONFIG['output_csv'], index=False)
     print(f"✅ Ensemble Training Data Saved to {CONFIG['output_csv']}")
 
