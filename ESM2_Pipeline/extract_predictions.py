@@ -97,7 +97,7 @@ sys.path.append(os.path.join(os.getcwd(), 'structure'))
 
 try:
     from train_finetune import ESM2FineTuneModel, AppConfig
-    from train_gnn_model import GraphBindingDataset
+    from train_gnn_model import EnsembleDataset  # Fixed: was GraphBindingDataset
 except ImportError as e:
     print(f"❌ IMPORTS FAILED: {e}")
     print("Ensure 'sequence/' and 'structure/' folders exist and contain train_finetune.py / train_gnn_model.py")
@@ -177,9 +177,9 @@ def collate_wrapper(batch, tokenizer):
     mhc_seqs, pep_seqs, mhc_graphs, pep_graphs, targets, lens, plddts = zip(*batch)
     mhc_tok = tokenizer(list(mhc_seqs), return_tensors='pt', padding='max_length', max_length=512, truncation=True)
     pep_tok = tokenizer(list(pep_seqs), return_tensors='pt', padding='max_length', max_length=512, truncation=True)
-    mhc_batch_graph = Batch.from_data_list(mhc_graphs)
-    pep_batch_graph = Batch.from_data_list(pep_graphs)
-    return mhc_tok, pep_tok, mhc_batch_graph, pep_batch_graph, torch.tensor(targets), lens, plddts
+    # Note: mhc_graphs and pep_graphs are already Batch objects (4 templates each from EnsembleDataset)
+    # Just pass them through as-is; the model handles Batch inputs
+    return mhc_tok, pep_tok, mhc_graphs, pep_graphs, torch.tensor(targets), lens, plddts
 
 # --- 5. MAIN ---
 def main():
@@ -190,7 +190,8 @@ def main():
     df = pd.read_csv(CONFIG['data_path']).dropna(subset=['mhc_sequence', 'peptide'])
     
     with open(CONFIG['gnn_mapping']) as f: mapping = json.load(f)
-    gnn_ds = GraphBindingDataset(df, mapping, CONFIG['gnn_mhc'], CONFIG['gnn_pep'], label_col='binding_affinity_nM')
+    # Fixed: EnsembleDataset does NOT use mapping (it loads by index)
+    gnn_ds = EnsembleDataset(df, CONFIG['gnn_mhc'], CONFIG['gnn_pep'], label_col='binding_affinity_nM')
     
     dataset = InferenceDataset(df, gnn_ds, tokenizer)
     loader = DataLoader(
@@ -212,10 +213,9 @@ def main():
             with torch.no_grad():
                 # ESM Inference & Unscaling
                 esm_raw = esm_model(esm_batch_mhc, esm_batch_pep)
-                # FIX: Standard Scaler inversion is usually (raw * scale) + min 
-                # (Assuming 'raw' is normalized output and we want real values)
-                # If your scaler was MinMax: (val - min)/(max-min) -> val = out * scale + min
-                esm_pred = (esm_raw * s_scale) + s_min 
+                # Unscale: StandardScaler formula is (raw * scale) + min_
+                # This assumes ESM output is standardized; scale is std dev
+                esm_pred = esm_raw * s_scale + s_min 
                 
                 # GNN Inference (Already in pIC50/log space due to HuberLoss training)
                 gnn_pred = gnn_model(mhc_graph, pep_graph)

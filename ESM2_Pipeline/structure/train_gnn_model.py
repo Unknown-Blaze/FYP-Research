@@ -25,6 +25,7 @@ import logging
 from datetime import datetime
 import sys
 import json
+import gc
 from tqdm import tqdm  # <--- NEW: For progress bars
 
 # ============================================================================
@@ -60,7 +61,7 @@ CONFIG = {
     'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
     
     # --- A100 OPTIMIZATIONS ---
-    'batch_size': 1024,           
+    'batch_size': 512,           
     'num_epochs': 150,        
     'learning_rate': 3e-4,        
     'warmup_epochs': 10,          
@@ -123,6 +124,10 @@ class EnsembleDataset(Dataset):
             try:
                 mhc_g = torch.load(mhc_path)
                 pep_g = torch.load(pep_path)
+                
+                if hasattr(mhc_g, 'y'): del mhc_g.y
+                if hasattr(pep_g, 'y'): del pep_g.y
+                
                 mhc_g = self._add_distance_features(mhc_g)
                 pep_g = self._add_distance_features(pep_g)
             except (FileNotFoundError, Exception):
@@ -307,6 +312,10 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 def main():
+    
+    import torch.multiprocessing
+    torch.multiprocessing.set_sharing_strategy('file_system') # <--- ADD THIS LINE
+    
     # --- Reproducibility Setup ---
     seed = CONFIG['seed']
     random.seed(seed)
@@ -333,11 +342,11 @@ def main():
     
     train_loader = DataLoader(
         train_ds, batch_size=CONFIG['batch_size'], shuffle=True, 
-        num_workers=8, pin_memory=True, persistent_workers=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         worker_init_fn=seed_worker, generator=g_seed 
     )
     test_loader = DataLoader(
-        test_ds, batch_size=CONFIG['batch_size'], num_workers=8, 
+        test_ds, batch_size=CONFIG['batch_size'], num_workers=4, 
         pin_memory=True, persistent_workers=True,
         worker_init_fn=seed_worker, generator=g_seed
     )
@@ -353,7 +362,8 @@ def main():
     checkpoint_best = "gnn_a100_best.pth"
     checkpoint_last = "gnn_a100_last.pth"
 
-    scaler = torch.amp.GradScaler('cuda')
+    # Auto-detect device for AMP (fixes CUDA-only issue)
+    scaler = torch.amp.GradScaler()
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
     criterion = nn.HuberLoss(delta=1.0) 
     
@@ -398,6 +408,9 @@ def main():
 
     for epoch in range(start_epoch, CONFIG['num_epochs']):
         current_lr = optimizer.param_groups[0]['lr']
+        
+        gc.collect()
+        torch.cuda.empty_cache()
         
         loss = train_epoch_amp(model, train_loader, optimizer, criterion, device, scaler, CONFIG['grad_clip_norm'])
         val_rmse, val_r2, val_pcc, val_scc = evaluate(model, test_loader, device)

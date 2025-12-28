@@ -24,22 +24,23 @@ def train_ensemble():
     y = df[target]
 
     # 3. Scale Features for the MLP (Neural Nets need scaled inputs)
-    # We don't scale 'esm_pred' and 'gnn_pred' usually for Linear Reg, 
-    # but for MLP it helps convergence.
+    # Both models now use same scaling and split for consistency
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # 4. Split Data (80/20)
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    # 4. Split Data (80/20) - same split for both models
+    X_train_scaled, X_test_scaled, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
     
-    print(f"\nTraining on {len(X_train)} samples, Testing on {len(X_test)} samples.")
+    # For linear model: also use scaled features for consistency
+    X_train_lin, X_test_lin, _, _ = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    
+    print(f"\nTraining on {len(X_train_scaled)} samples, Testing on {len(X_test_scaled)} samples.")
 
     # --- STRATEGY 1: Linear Mixer ---
-    # We use original X for Linear Regression interpretation
-    X_lin_train, X_lin_test, _, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Use scaled features for both linear and MLP for consistency
     
     linear_model = LinearRegression()
-    linear_model.fit(X_lin_train[['esm_pred', 'gnn_pred']], y_train) # Only use predictions for Linear
+    linear_model.fit(X_train_lin[['esm_pred', 'gnn_pred']], y_train) # Only use predictions for Linear
     
     print("\n" + "="*40)
     print("📊 LINEAR MIXER WEIGHTS")
@@ -59,7 +60,7 @@ def train_ensemble():
         learning_rate_init=0.001,
         early_stopping=True
     )
-    mlp_model.fit(X_train, y_train)
+    mlp_model.fit(X_train_scaled, y_train)
 
     # --- EVALUATION ---
     print("\n" + "="*40)
@@ -72,9 +73,11 @@ def train_ensemble():
         return r2, rmse
 
     # Get Single Model Performance (from the Test set slice)
-    # Note: X_lin_test is a DataFrame, so we access columns by name
-    esm_preds = X_lin_test['esm_pred']
-    gnn_preds = X_lin_test['gnn_pred']
+    # Access raw feature values from original unscaled data
+    X_orig_train, X_orig_test, _, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    esm_preds = X_orig_test['esm_pred']
+    gnn_preds = X_orig_test['gnn_pred']
     
     r2_esm, rmse_esm = evaluate(esm_preds, "ESM Only")
     r2_gnn, rmse_gnn = evaluate(gnn_preds, "GNN Only")
@@ -83,18 +86,19 @@ def train_ensemble():
     print(f"2. GNN Only    -> R2: {r2_gnn:.4f} | RMSE: {rmse_gnn:.4f}")
 
     # Get Ensemble Performance
-    lin_preds = linear_model.predict(X_lin_test[['esm_pred', 'gnn_pred']])
+    lin_preds = linear_model.predict(X_test_lin[['esm_pred', 'gnn_pred']])
     r2_lin, rmse_lin = evaluate(lin_preds, "Linear Stack")
     print(f"3. Linear Stack-> R2: {r2_lin:.4f} | RMSE: {rmse_lin:.4f}")
 
-    mlp_preds = mlp_model.predict(X_test)
+    mlp_preds = mlp_model.predict(X_test_scaled)
     r2_mlp, rmse_mlp = evaluate(mlp_preds, "Neural Stack")
     print(f"4. Neural Stack-> R2: {r2_mlp:.4f} | RMSE: {rmse_mlp:.4f}")
 
-    # Save
+    # Save both models and scaler for inference
+    joblib.dump(linear_model, "linear_meta_learner.pkl")
     joblib.dump(mlp_model, "best_meta_learner_mlp.pkl")
     joblib.dump(scaler, "meta_learner_scaler.pkl") # Save scaler for inference!
-    print("\n✅ Saved MLP model and Scaler.")
+    print("\n✅ Saved Linear and MLP models with Scaler.")
 
 if __name__ == "__main__":
     train_ensemble()
