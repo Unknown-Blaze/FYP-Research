@@ -131,11 +131,8 @@ def load_models(device):
     # 2. ESM Scaler
     try:
         scaler = joblib.load(CONFIG['esm_scaler'])
-        # If your scaler was MinMax/Standard, unscaling is typically: pred * scale + min
-        scaler_min = torch.tensor(scaler.min_[0], device=device) if hasattr(scaler, 'min_') else 0.0
-        scaler_scale = torch.tensor(scaler.scale_[0], device=device) if hasattr(scaler, 'scale_') else 1.0
-    except:
-        scaler_min, scaler_scale = 0.0, 1.0
+    except Exception:
+        scaler = None
 
     # 3. GNN Model
     print(f"⏳ Loading GNN from {CONFIG['gnn_ckpt']}...")
@@ -160,7 +157,7 @@ def load_models(device):
     gnn_model.load_state_dict(state)
     gnn_model.eval()
     
-    return esm_model, gnn_model, tokenizer, scaler_min, scaler_scale
+    return esm_model, gnn_model, tokenizer, scaler
 
 # ============================================================================
 # 4. INFERENCE DATASET & COLLATE FIX
@@ -203,7 +200,7 @@ def collate_wrapper(batch, tokenizer):
 # ============================================================================
 def main():
     device = torch.device(CONFIG['device'])
-    esm_model, gnn_model, tokenizer, s_min, s_scale = load_models(device)
+    esm_model, gnn_model, tokenizer, scaler = load_models(device)
     
     print("⏳ Reading CSV...")
     df = pd.read_csv(CONFIG['data_path']).dropna(subset=['mhc_sequence', 'peptide'])
@@ -238,7 +235,12 @@ def main():
             with torch.no_grad():
                 # 1. ESM Prediction
                 esm_raw = esm_model(esm_batch_mhc, esm_batch_pep)
-                esm_pred = esm_raw * s_scale + s_min 
+                # Robust inverse transform using the saved scaler (supports StandardScaler/MinMaxScaler)
+                if scaler is not None:
+                    esm_pred_np = scaler.inverse_transform(esm_raw.detach().cpu().reshape(-1, 1)).reshape(-1)
+                    esm_pred = torch.from_numpy(esm_pred_np).to(device)
+                else:
+                    esm_pred = esm_raw.squeeze()
                 
                 # 2. GNN Prediction
                 gnn_pred = gnn_model(mhc_graph, pep_graph)

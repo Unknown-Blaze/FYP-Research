@@ -2,3 +2,15 @@
 2025-12-28 12:06:58 | INFO | Train Size: 72783 | Test Size: 12845
 2025-12-28 12:06:59 | INFO | 🔄 Found checkpoint: gnn_a100_last.pth. Resuming...
 2025-12-28 12:06:59 | INFO | ⏩ Resumed at Epoch 14 (Best RMSE: 1.3356)
+2025-12-28 13:01:05 | INFO | Ep 015 | LR 3.00e-04 | Train Loss 0.6153 | Val RMSE 1.2749 | Val R2 0.1966 | Val PCC 0.4838
+2025-12-28 13:01:06 | INFO | ⭐ New Best Model Saved
+2025-12-28 13:53:48 | INFO | Ep 016 | LR 3.00e-04 | Train Loss 0.6139 | Val RMSE 1.2724 | Val R2 0.1997 | Val PCC 0.4950
+2025-12-28 13:53:49 | INFO | ⭐ New Best Model Saved
+2025-12-28 14:46:16 | INFO | Ep 017 | LR 3.00e-04 | Train Loss 0.6118 | Val RMSE 1.3496 | Val R2 0.0997 | Val PCC 0.4775
+2025-12-28 14:46:16 | INFO | ⏳ Patience: 1/20
+2025-12-28 15:38:10 | INFO | Ep 018 | LR 3.00e-04 | Train Loss 0.6077 | Val RMSE 1.2438 | Val R2 0.2353 | Val PCC 0.5018
+2025-12-28 15:38:11 | INFO | ⭐ New Best Model Saved
+2025-12-28 16:29:53 | INFO | Ep 019 | LR 3.00e-04 | Train Loss 0.6048 | Val RMSE 1.3080 | Val R2 0.1543 | Val PCC 0.5132
+2025-12-28 16:29:53 | INFO | ⏳ Patience: 1/20
+2025-12-28 17:21:16 | INFO | Ep 020 | LR 3.00e-04 | Train Loss 0.6039 | Val RMSE 1.2827 | Val R2 0.1866 | Val PCC 0.5130
+2025-12-28 17:21:16 | INFO | ⏳ Patience: 2/20

@@ -12,6 +12,7 @@ from tqdm import tqdm
 import logging
 import warnings
 import os
+from torch_cluster import radius_graph # Explicit import
 
 # Suppress PDB warnings
 warnings.filterwarnings("ignore")
@@ -25,6 +26,7 @@ INPUT_CSV = "../iedb_dataset.csv"
 # Initialize output directories
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 (OUT_DIR / "mhc").mkdir(exist_ok=True)
+# We don't strictly need the peptide folder anymore, but keeping it doesn't hurt
 (OUT_DIR / "peptide").mkdir(exist_ok=True)
 
 # CHEMICAL DICTIONARIES
@@ -32,22 +34,46 @@ AMINO_ACIDS = ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'I
 AA_TO_IDX = {aa: i for i, aa in enumerate(AMINO_ACIDS)}
 HYDROPHOBICITY = {'ALA': 1.8, 'ARG': -4.5, 'ASN': -3.5, 'ASP': -3.5, 'CYS': 2.5, 'GLN': -3.5, 'GLU': -3.5, 'GLY': -0.4, 'HIS': -3.2, 'ILE': 4.5, 'LEU': 3.8, 'LYS': -3.9, 'MET': 1.9, 'PHE': 2.8, 'PRO': -1.6, 'SER': -0.8, 'THR': -0.7, 'TRP': -0.9, 'TYR': -1.3, 'VAL': 4.2}
 
-def get_residue_features(aa_char):
-    three_letter_map = {'A':'ALA','R':'ARG','N':'ASN','D':'ASP','C':'CYS','Q':'GLN','E':'GLU','G':'GLY','H':'HIS','I':'ILE','L':'LEU','K':'LYS','M':'MET','F':'PHE','P':'PRO','S':'SER','T':'THR','W':'TRP','Y':'TYR','V':'VAL'}
-    res_name = three_letter_map.get(aa_char, 'ALA')
+# Updated Feature Dictionary
+AA_PROPERTIES = {
+    # Charge, Polarity (0/1), Aromaticity (0/1), VanDerWaals Volume (normed)
+    'ALA': [0, 0, 0, 0.2], 'ARG': [1, 1, 0, 0.8], 'ASN': [0, 1, 0, 0.5],
+    'ASP': [-1, 1, 0, 0.5], 'CYS': [0, 0, 0, 0.4], 'GLN': [0, 1, 0, 0.6],
+    'GLU': [-1, 1, 0, 0.6], 'GLY': [0, 0, 0, 0.0], 'HIS': [0.5, 1, 1, 0.6], # Histidine neutral/protonated
+    'ILE': [0, 0, 0, 0.7], 'LEU': [0, 0, 0, 0.7], 'LYS': [1, 1, 0, 0.7],
+    'MET': [0, 0, 0, 0.7], 'PHE': [0, 0, 1, 0.8], 'PRO': [0, 0, 0, 0.4],
+    'SER': [0, 1, 0, 0.3], 'THR': [0, 1, 0, 0.4], 'TRP': [0, 1, 1, 1.0],
+    'TYR': [0, 1, 1, 0.9], 'VAL': [0, 0, 0, 0.5],
+}
+
+# --- HELPER FUNCTIONS ---
+
+def rbf_expansion(distances, num_centers=16, cutoff=10.0):
+    """
+    Expands scalar distances into a vector of radial basis functions.
+    This helps the GNN learn non-linear distance relationships.
+    """
+    centers = torch.linspace(0, cutoff, num_centers, device=distances.device)
+    width = centers[1] - centers[0]
+    return torch.exp(-((distances.unsqueeze(-1) - centers) ** 2) / width)
+
+def get_physico_chemical_features(aa_char):
+    three_letter_map = {'A':'ALA','R':'ARG','N':'ASN','D':'ASP','C':'CYS',
+                        'Q':'GLN','E':'GLU','G':'GLY','H':'HIS','I':'ILE',
+                        'L':'LEU','K':'LYS','M':'MET','F':'PHE','P':'PRO',
+                        'S':'SER','T':'THR','W':'TRP','Y':'TYR','V':'VAL'}
+    res = three_letter_map.get(aa_char, 'ALA')
     
-    # 1. Identity (21)
-    res_one_hot = np.zeros(21, dtype=np.float32)
-    if res_name in AA_TO_IDX: res_one_hot[AA_TO_IDX[res_name]] = 1.0
-    else: res_one_hot[-1] = 1.0
+    # 1. Physics Props (4 dims)
+    props = np.array(AA_PROPERTIES.get(res, [0,0,0,0]), dtype=np.float32)
     
-    # 2. Hydrophobicity (1)
-    hyd = [HYDROPHOBICITY.get(res_name, 0.0) / 4.5]
+    # 2. Hydrophobicity (1 dim)
+    hyd = np.array([HYDROPHOBICITY.get(res, 0.0) / 4.5], dtype=np.float32)
     
-    # 3. Confidence (1) -> SET TO 1.0 (TRUSTED CRYSTAL)
-    plddt = [1.0] 
+    # 3. pLDDT (1 dim) - Keep this, it guides the GNN to trust good regions
+    plddt = np.array([1.0], dtype=np.float32) 
     
-    return np.concatenate([res_one_hot, hyd, plddt])
+    return np.concatenate([props, hyd, plddt]) # Total 6 dims (Very compact)
 
 def load_template_backbone(pdb_path):
     """
@@ -78,42 +104,55 @@ def load_template_backbone(pdb_path):
             
     return np.array(mhc_coords), np.array(pep_coords)
 
-def create_threaded_graph(mhc_seq, pep_seq, mhc_template_pos, pep_template_pos, ic50):
-    # Thread MHC (Truncate or Pad to match template)
-    mhc_feats = []
-    target_mhc_len = len(mhc_template_pos)
-    for i in range(target_mhc_len):
-        aa = mhc_seq[i] if i < len(mhc_seq) else 'A'
-        mhc_feats.append(get_residue_features(aa))
-        
-    # Thread Peptide (Truncate or Pad)
-    pep_feats = []
-    target_pep_len = len(pep_template_pos)
-    for i in range(target_pep_len):
-        aa = pep_seq[i] if i < len(pep_seq) else 'A'
-        pep_feats.append(get_residue_features(aa))
-        
-    # Build Tensors
-    x_mhc = torch.tensor(np.array(mhc_feats), dtype=torch.float32)
-    pos_mhc = torch.tensor(mhc_template_pos, dtype=torch.float32)
-    x_pep = torch.tensor(np.array(pep_feats), dtype=torch.float32)
-    pos_pep = torch.tensor(pep_template_pos, dtype=torch.float32)
+def create_unified_interaction_graph(mhc_seq, pep_seq, mhc_pos, pep_pos, ic50):
+    # 0. Select GPU (Uses the first available one)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 1. Concat Features & Coordinates (Create on CPU first)
+    mhc_feats = [get_physico_chemical_features(aa) for aa in mhc_seq]
+    pep_feats = [get_physico_chemical_features(aa) for aa in pep_seq]
     
-    # Build Edges
-    edge_index_mhc = torch.stack([torch.arange(target_mhc_len-1), torch.arange(1, target_mhc_len)], dim=0)
-    edge_index_pep = torch.stack([torch.arange(target_pep_len-1), torch.arange(1, target_pep_len)], dim=0)
+    # Move to GPU immediately
+    x = torch.tensor(np.array(mhc_feats + pep_feats), dtype=torch.float32, device=device)
     
-    # Dummy Edge Attr (Dim 16 for GNN RBF)
-    edge_attr_mhc = torch.zeros((edge_index_mhc.size(1), 16), dtype=torch.float32)
-    edge_attr_pep = torch.zeros((edge_index_pep.size(1), 16), dtype=torch.float32)
+    # 2. Concat Positions & Move to GPU
+    pos_mhc = torch.tensor(mhc_pos, dtype=torch.float32, device=device)
+    pos_pep = torch.tensor(pep_pos, dtype=torch.float32, device=device)
+    pos = torch.cat([pos_mhc, pos_pep], dim=0)
+    
+    # 3. Create Batch/Mask vector (GPU)
+    batch_mask = torch.cat([
+        torch.zeros(len(mhc_pos), device=device), 
+        torch.ones(len(pep_pos), device=device)
+    ], dim=0)
+
+    # 4. Generate Spatial Edges (NOW FAST ON GPU)
+    # torch_cluster will uses CUDA kernels here
+    edge_index = radius_graph(pos, r=10.0, loop=False)
+    
+    # 5. Calculate Edge Distances (GPU)
+    row, col = edge_index
+    dist = (pos[row] - pos[col]).norm(dim=-1)
+    
+    # Encode distance using RBF (GPU)
+    # THIS FUNCTION WAS MISSING IN YOUR PASTE
+    edge_attr = rbf_expansion(dist, num_centers=16, cutoff=10.0)
 
     # Target
     pIC50 = -np.log10(ic50 * 1e-9 + 1e-12)
 
-    mhc_data = Data(x=x_mhc, pos=pos_mhc, edge_index=edge_index_mhc, edge_attr=edge_attr_mhc)
-    pep_data = Data(x=x_pep, pos=pos_pep, edge_index=edge_index_pep, edge_attr=edge_attr_pep, y=torch.tensor([pIC50]))
+    # 6. Move everything BACK to CPU for saving to disk
+    # (We don't want to save CUDA tensors; they are messy to load later)
+    data = Data(
+        x=x.cpu(), 
+        pos=pos.cpu(), 
+        edge_index=edge_index.cpu(), 
+        edge_attr=edge_attr.cpu(), 
+        chain_mask=batch_mask.cpu(), 
+        y=torch.tensor([pIC50])
+    )
     
-    return mhc_data, pep_data
+    return data
 
 def main():
     # 1. Load ALL Templates into memory first
@@ -128,26 +167,27 @@ def main():
     # 2. Process CSV
     df = pd.read_csv("../iedb_dataset.csv").dropna(subset=['mhc_sequence', 'peptide', 'binding_affinity_nM'])
     
+    # Ensure directories exist
     (OUT_DIR / "mhc").mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "peptide").mkdir(parents=True, exist_ok=True)
 
     print(f"Threading {len(df)} samples against {len(templates_cache)} templates...")
     
     for idx, row in tqdm(df.iterrows(), total=len(df)):
-        # Generate 4 versions of the graph
         for t_idx, (mhc_coords, pep_coords) in enumerate(templates_cache):
             try:
-                mhc_g, pep_g = create_threaded_graph(
+                # Returns ONE unified object
+                unified_graph = create_unified_interaction_graph(
                     row['mhc_sequence'].upper(), 
                     row['peptide'].upper(), 
                     mhc_coords, 
                     pep_coords, 
                     row['binding_affinity_nM']
                 )
-                # Save with T{index} suffix
-                torch.save(mhc_g, OUT_DIR / "mhc" / f"{idx}_T{t_idx}.pt")
-                torch.save(pep_g, OUT_DIR / "peptide" / f"{idx}_T{t_idx}.pt")
-            except Exception:
+                
+                # Save into the 'mhc' folder (serving as the main graph folder now)
+                torch.save(unified_graph, OUT_DIR / "mhc" / f"{idx}_T{t_idx}.pt")
+                
+            except Exception as e:
                 pass # Skip failed threads
 
 if __name__ == "__main__":

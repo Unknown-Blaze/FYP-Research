@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 CONFIG = {
-    'input_dim': 23,  
+    'input_dim': 6,  
     'dataset_path': '../iedb_dataset.csv',
     'graphs_dir_mhc': 'data/graphs/ensemble/mhc',
     'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
@@ -89,10 +89,9 @@ def rbf_expansion(distances, num_centers=16, cutoff=10.0):
 class EnsembleDataset(Dataset):
     def __init__(self, df, graphs_dir_mhc, graphs_dir_peptide, label_col='binding_affinity_nM'):
         self.df = df.copy()
-        self.graphs_dir_mhc = Path(graphs_dir_mhc)
-        self.graphs_dir_peptide = Path(graphs_dir_peptide)
+        # We only need one directory now since the graph is unified
+        self.graphs_dir = Path(graphs_dir_mhc) 
         
-        # Smart label detection
         if label_col not in self.df.columns and 'IC50' in self.df.columns:
             self.label_col = 'IC50'
         else:
@@ -101,53 +100,40 @@ class EnsembleDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-    def _add_distance_features(self, graph):
-        if graph.edge_index.numel() > 0:
-            row, col = graph.edge_index
-            coord_diff = graph.pos[row] - graph.pos[col]
-            radial_dist = torch.norm(coord_diff, dim=-1)
-            graph.edge_attr = rbf_expansion(radial_dist, num_centers=16)
-        else:
-            graph.edge_attr = torch.zeros((0, 16), dtype=torch.float32)
-        return graph
-
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        mhc_list = []
-        pep_list = []
+        graph_list = []
         
         for t in range(4):
+            # We look for the file we saved in Step 1
             file_id = f"{row.name}_T{t}.pt"
-            mhc_path = self.graphs_dir_mhc / file_id
-            pep_path = self.graphs_dir_peptide / file_id
+            path = self.graphs_dir / file_id
             
-            mhc_g, pep_g = None, None
             try:
-                mhc_g = torch.load(mhc_path)
-                pep_g = torch.load(pep_path)
+                # LOAD UNIFIED GRAPH
+                graph = torch.load(path)
                 
-                if hasattr(mhc_g, 'y'): del mhc_g.y
-                if hasattr(pep_g, 'y'): del pep_g.y
+                # Safety check for labels
+                if hasattr(graph, 'y'): del graph.y
                 
-                mhc_g = self._add_distance_features(mhc_g)
-                pep_g = self._add_distance_features(pep_g)
+                # Add distance features (if not already done in generation)
+                # Note: create_unified_interaction_graph ALREADY adds edge_attr, 
+                # so we can skip _add_distance_features or keep it as backup.
+                
             except (FileNotFoundError, Exception):
-                pass
-
-            if mhc_g is None or pep_g is None:
-                # Optimized dummy generation
+                # Create dummy if missing
                 dummy_x = torch.zeros((1, CONFIG['input_dim']), dtype=torch.float32)
                 dummy_pos = torch.zeros((1, 3), dtype=torch.float32)
                 dummy_edge = torch.zeros((2, 0), dtype=torch.long)
                 dummy_attr = torch.zeros((0, 16), dtype=torch.float32)
-                mhc_g = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, edge_attr=dummy_attr)
-                pep_g = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, edge_attr=dummy_attr)
+                dummy_mask = torch.zeros(1, dtype=torch.float32)
+                graph = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, 
+                             edge_attr=dummy_attr, batch=torch.zeros(1).long())
 
-            mhc_list.append(mhc_g)
-            pep_list.append(pep_g)
+            graph_list.append(graph)
 
-        mhc_batch = Batch.from_data_list(mhc_list)
-        pep_batch = Batch.from_data_list(pep_list)
+        # Create the Batch
+        batch = Batch.from_data_list(graph_list)
 
         try:
             val = float(row[self.label_col])
@@ -156,7 +142,8 @@ class EnsembleDataset(Dataset):
         except:
             target = 0.0
 
-        return mhc_batch, pep_batch, float(target)
+        # RETURN ONLY ONE BATCH OBJECT + TARGET
+        return batch, float(target)
 
 # ============================================================================
 # 3. Model
@@ -176,77 +163,83 @@ class MultiHeadAttentionFusion(nn.Module):
         return self.norm(attn_output + query).squeeze(1)
 
 class EnsembleGraphNetwork(nn.Module):
-    def __init__(self, input_dim=23, hidden_dims=[512, 512, 512], num_heads=16, dropout=0.3):
+    def __init__(self, input_dim=6, hidden_dims=[256, 256, 256], num_heads=8, dropout=0.3):
+        """
+        Changed input_dim to 6 (assuming you use the new Physics features).
+        If you stick to One-Hot, change back to 23.
+        """
         super().__init__()
         self.dropout = dropout
+        
+        # --- 1. GNN Backbone (Unified) ---
         dims = [input_dim] + hidden_dims
         self.gat_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.input_norm = nn.BatchNorm1d(input_dim)
         
         for i in range(len(dims) - 1):
+            # Edge dim is 16 (for the RBF distances)
             self.gat_layers.append(
-                GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, dropout=dropout, edge_dim=16)
+                GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, 
+                          dropout=dropout, edge_dim=16, concat=True)
             )
             self.norms.append(nn.LayerNorm(dims[i+1]))
             
         self.graph_dim = dims[-1]
-        
-        self.mhc_to_pep_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        self.pep_to_mhc_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        
-        self.embedding_dim = 4 * self.graph_dim
-        self.fusion_module = MultiHeadAttentionFusion(self.embedding_dim, num_heads=num_heads)
-        
-        self.fc_layers = nn.Sequential(
-            nn.Linear(self.embedding_dim, 1024),
-            nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(1024, 512),
-            nn.LayerNorm(512), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(512, 1)
+
+        # --- 2. Interface-Aware Pooling ---
+        # Instead of averaging everything, this learns WHICH nodes are important
+        # (e.g., The model will learn to focus on the binding pocket nodes)
+        self.pool_gate = nn.Sequential(
+            nn.Linear(self.graph_dim, 1),
+            nn.Sigmoid()
         )
-    
-    def process_subgraph(self, x, edge_index, edge_attr, batch):
-        x = self.input_norm(x)
+        self.global_pool = GlobalAttention(gate_nn=self.pool_gate)
+
+        # --- 3. Template Fusion (Same as before) ---
+        self.fusion_module = MultiHeadAttentionFusion(self.graph_dim, num_heads=num_heads)
+
+        # --- 4. Prediction Head ---
+        self.fc_layers = nn.Sequential(
+            nn.Linear(self.graph_dim, 128),
+            nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, data):
+        # NOTE: Input is now a SINGLE unified graph object 'data'
+        # It contains both MHC and Peptide nodes connected by spatial edges.
+        
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        
+        # 1. Message Passing (Physics happens here!)
+        # Information flows between MHC nodes and Peptide nodes via the edges
         for gat, norm in zip(self.gat_layers, self.norms):
             x_in = x
-            if edge_index.numel() > 0:
-                x = gat(x, edge_index, edge_attr=edge_attr)
+            x = gat(x, edge_index, edge_attr=edge_attr)
             
-            # Residual if shapes match
-            if x.shape[1] == x_in.shape[1]: 
-                x = x + x_in 
+            # Residual connection (if dimensions match)
+            if x.shape[1] == x_in.shape[1]:
+                x = x + x_in
             
             x = norm(x)
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-        return x
 
-    def forward(self, mhc, pep):
-        mhc_feats = self.process_subgraph(mhc.x, mhc.edge_index, mhc.edge_attr, mhc.batch)
-        pep_feats = self.process_subgraph(pep.x, pep.edge_index, pep.edge_attr, pep.batch)
+        # 2. Pooling (Extract Interaction Signal)
+        # [Total_Nodes, Dim] -> [Batch_Size * 4, Dim]
+        graph_embed = self.global_pool(x, batch)
         
-        mhc_dense, mhc_mask = to_dense_batch(mhc_feats, mhc.batch)
-        pep_dense, pep_mask = to_dense_batch(pep_feats, pep.batch)
+        # 3. Template Fusion
+        # Reshape: [Batch*4, Dim] -> [Batch, 4, Dim]
+        # This combines the 4 structural templates into one consensus vector
+        actual_batch_size = graph_embed.shape[0] // 4
+        templates_view = graph_embed.view(actual_batch_size, 4, -1)
         
-        pep_ctx, _ = self.pep_to_mhc_attn(pep_dense, mhc_dense, mhc_dense, key_padding_mask=~mhc_mask)
-        mhc_ctx, _ = self.mhc_to_pep_attn(mhc_dense, pep_dense, pep_dense, key_padding_mask=~pep_mask)
-        
-        def masked_pool(tensor, mask):
-            return (tensor * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
-
-        combined = torch.cat([
-            masked_pool(mhc_dense, mhc_mask),
-            masked_pool(pep_dense, pep_mask),
-            masked_pool(mhc_ctx, mhc_mask),
-            masked_pool(pep_ctx, pep_mask)
-        ], dim=1)
-        
-        # Reshape for fusion (Batch * 4 -> Batch, 4, Feats)
-        actual_batch_size = combined.shape[0] // 4
-        templates_view = combined.view(actual_batch_size, 4, -1)
         fused_vec = self.fusion_module(templates_view)
         
+        # 4. Final Regression
         return self.fc_layers(fused_vec).squeeze()
 
 # ============================================================================
@@ -256,30 +249,23 @@ class EnsembleGraphNetwork(nn.Module):
 def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_clip_norm):
     model.train()
     total_loss = 0
-    
-    # Initialize optimizer
     optimizer.zero_grad(set_to_none=True)
-    
     pbar = tqdm(loader, desc="Training", leave=False, dynamic_ncols=True)
-    
-    # Accumulation counter
     accum_steps = CONFIG.get('grad_accum_steps', 1)
     
-    for i, (mhc, pep, y) in enumerate(pbar):
-        mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
+    # CHANGE: Unpack only 2 items (Data, Target)
+    for i, (data, y) in enumerate(pbar):
+        data = data.to(device)
+        y = y.to(device)
         
-        # 1. Forward Pass
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            pred = model(mhc, pep)
+            # CHANGE: Pass single data object to model
+            pred = model(data)
             loss = criterion(pred, y.float())
-            
-            # Normalize loss for accumulation
             loss = loss / accum_steps
         
-        # 2. Backward Pass (Accumulate Gradients)
         scaler.scale(loss).backward()
         
-        # 3. Optimizer Step (Only every 'accum_steps' iterations)
         if (i + 1) % accum_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
@@ -287,22 +273,11 @@ def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_cl
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
         
-        # Track total loss (multiply back to get real loss value for logging)
         total_loss += loss.item() * accum_steps
         pbar.set_postfix({'loss': f"{loss.item() * accum_steps:.4f}"})
-        
-        if USE_WANDB:
-            wandb.log({"train_step_loss": loss.item() * accum_steps})
-
-    # Handle remaining gradients if total batches isn't divisible by accum_steps
-    if (i + 1) % accum_steps != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
 
     return total_loss / len(loader)
+
 
 def evaluate(model, loader, device):
     model.eval()
