@@ -12,7 +12,8 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv
+# --- FIX 1: Added GlobalAttention import ---
+from torch_geometric.nn import GATv2Conv, GlobalAttention
 from torch_geometric.utils import to_dense_batch
 from torch_geometric.loader import DataLoader 
 from torch_geometric.data import Data, Batch 
@@ -26,29 +27,7 @@ from datetime import datetime
 import sys
 import json
 import gc
-from tqdm import tqdm  # <--- NEW: For progress bars
-
-# ============================================================================
-# 0. Global Setup & Logging
-# ============================================================================
-
-# Toggle this for professional experiment tracking
-USE_WANDB = False 
-
-if USE_WANDB:
-    import wandb
-
-log_file = f"gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+from tqdm import tqdm
 
 # ============================================================================
 # 1. Configuration (A100 TUNED)
@@ -60,14 +39,15 @@ CONFIG = {
     'graphs_dir_mhc': 'data/graphs/ensemble/mhc',
     'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
     
-    # --- A100 OPTIMIZATIONS ---
+    # --- NEW: ORGANIZATION PATHS ---
+    'logs_dir': 'logs',           # <--- New folder for logs
+    'checkpoints_dir': 'checkpoints', # <--- New folder for models
+    
     'batch_size': 128,
     'grad_accum_steps': 4,          
     'num_epochs': 150,        
     'learning_rate': 3e-4,        
     'warmup_epochs': 10,          
-    
-    # --- ARCHITECTURE ---
     'hidden_dims': [512, 512, 512],
     'num_heads': 16,                
     'dropout': 0.3,               
@@ -76,6 +56,33 @@ CONFIG = {
     'grad_clip_norm': 1.0,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
+
+# Create directories immediately
+Path(CONFIG['logs_dir']).mkdir(parents=True, exist_ok=True)
+Path(CONFIG['checkpoints_dir']).mkdir(parents=True, exist_ok=True)
+
+# ============================================================================
+# 0. Global Setup & Logging
+# ============================================================================
+
+USE_WANDB = False 
+
+if USE_WANDB:
+    import wandb
+
+# CHANGE: Path joins the directory with the filename
+log_file = Path(CONFIG['logs_dir']) / f"gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # 2. Dataset & Helper Functions
@@ -112,13 +119,27 @@ class EnsembleDataset(Dataset):
             try:
                 # LOAD UNIFIED GRAPH
                 graph = torch.load(path)
-                
+                                
                 # Safety check for labels
                 if hasattr(graph, 'y'): del graph.y
-                
-                # Add distance features (if not already done in generation)
-                # Note: create_unified_interaction_graph ALREADY adds edge_attr, 
-                # so we can skip _add_distance_features or keep it as backup.
+
+                # --- SANITY CHECK 1: Prune Bad Edges (Fixes "device-side assert") ---
+                num_nodes = graph.x.size(0)
+                if graph.edge_index.numel() > 0:
+                    mask = (graph.edge_index[0] < num_nodes) & (graph.edge_index[1] < num_nodes)
+                    graph.edge_index = graph.edge_index[:, mask]
+                    if graph.edge_attr is not None:
+                        graph.edge_attr = graph.edge_attr[mask]
+                # --------------------------------------------------------------------
+
+                # --- FIX PART 1: Force chain_mask to be BOOL ---
+                if hasattr(graph, 'chain_mask'):
+                    # If it exists, FORCE convert to bool (fixes the crash)
+                    graph.chain_mask = graph.chain_mask.bool()
+                else:
+                    # If missing, create default boolean mask
+                    graph.chain_mask = torch.ones(num_nodes, dtype=torch.bool)
+                # ------------------------------------------------
                 
             except (FileNotFoundError, Exception):
                 # Create dummy if missing
@@ -126,9 +147,15 @@ class EnsembleDataset(Dataset):
                 dummy_pos = torch.zeros((1, 3), dtype=torch.float32)
                 dummy_edge = torch.zeros((2, 0), dtype=torch.long)
                 dummy_attr = torch.zeros((0, 16), dtype=torch.float32)
-                dummy_mask = torch.zeros(1, dtype=torch.float32)
+                
+                # --- FIX PART 2: Dummy mask must also be BOOL ---
+                dummy_mask = torch.zeros(1, dtype=torch.bool)
+                # ------------------------------------------------
+
+                # Important: Add batch attribute AND chain_mask for dummy
                 graph = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, 
-                             edge_attr=dummy_attr, batch=torch.zeros(1).long())
+                             edge_attr=dummy_attr, batch=torch.zeros(1).long(),
+                             chain_mask=dummy_mask) 
 
             graph_list.append(graph)
 
@@ -164,10 +191,6 @@ class MultiHeadAttentionFusion(nn.Module):
 
 class EnsembleGraphNetwork(nn.Module):
     def __init__(self, input_dim=6, hidden_dims=[256, 256, 256], num_heads=8, dropout=0.3):
-        """
-        Changed input_dim to 6 (assuming you use the new Physics features).
-        If you stick to One-Hot, change back to 23.
-        """
         super().__init__()
         self.dropout = dropout
         
@@ -188,14 +211,13 @@ class EnsembleGraphNetwork(nn.Module):
 
         # --- 2. Interface-Aware Pooling ---
         # Instead of averaging everything, this learns WHICH nodes are important
-        # (e.g., The model will learn to focus on the binding pocket nodes)
         self.pool_gate = nn.Sequential(
             nn.Linear(self.graph_dim, 1),
             nn.Sigmoid()
         )
         self.global_pool = GlobalAttention(gate_nn=self.pool_gate)
 
-        # --- 3. Template Fusion (Same as before) ---
+        # --- 3. Template Fusion ---
         self.fusion_module = MultiHeadAttentionFusion(self.graph_dim, num_heads=num_heads)
 
         # --- 4. Prediction Head ---
@@ -209,12 +231,9 @@ class EnsembleGraphNetwork(nn.Module):
 
     def forward(self, data):
         # NOTE: Input is now a SINGLE unified graph object 'data'
-        # It contains both MHC and Peptide nodes connected by spatial edges.
-        
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         
         # 1. Message Passing (Physics happens here!)
-        # Information flows between MHC nodes and Peptide nodes via the edges
         for gat, norm in zip(self.gat_layers, self.norms):
             x_in = x
             x = gat(x, edge_index, edge_attr=edge_attr)
@@ -228,12 +247,9 @@ class EnsembleGraphNetwork(nn.Module):
             x = F.dropout(x, p=self.dropout, training=self.training)
 
         # 2. Pooling (Extract Interaction Signal)
-        # [Total_Nodes, Dim] -> [Batch_Size * 4, Dim]
         graph_embed = self.global_pool(x, batch)
         
         # 3. Template Fusion
-        # Reshape: [Batch*4, Dim] -> [Batch, 4, Dim]
-        # This combines the 4 structural templates into one consensus vector
         actual_batch_size = graph_embed.shape[0] // 4
         templates_view = graph_embed.view(actual_batch_size, 4, -1)
         
@@ -253,13 +269,17 @@ def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_cl
     pbar = tqdm(loader, desc="Training", leave=False, dynamic_ncols=True)
     accum_steps = CONFIG.get('grad_accum_steps', 1)
     
-    # CHANGE: Unpack only 2 items (Data, Target)
+    # Correct: Unpack only 2 items
     for i, (data, y) in enumerate(pbar):
         data = data.to(device)
         y = y.to(device)
         
+        num_nodes = data.x.size(0)
+        if data.edge_index.max() >= num_nodes:
+            print(f"Skipping Bad Batch! Max edge index {data.edge_index.max()} >= Num nodes {num_nodes}")
+            continue
+        
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            # CHANGE: Pass single data object to model
             pred = model(data)
             loss = criterion(pred, y.float())
             loss = loss / accum_steps
@@ -278,15 +298,18 @@ def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_cl
 
     return total_loss / len(loader)
 
-
 def evaluate(model, loader, device):
     model.eval()
     preds, actuals = [], []
     
     with torch.no_grad():
-        for mhc, pep, y in loader:
-            mhc, pep, y = mhc.to(device), pep.to(device), y.to(device)
-            pred = model(mhc, pep)
+        # --- FIX 2: Updated loop to match new dataset (data, y) ---
+        for data, y in loader:
+            data = data.to(device)
+            y = y.to(device)
+            
+            pred = model(data)
+            
             preds.extend(pred.cpu().numpy())
             actuals.extend(y.cpu().numpy())
     
@@ -310,7 +333,7 @@ def seed_worker(worker_id):
 def main():
     
     import torch.multiprocessing
-    torch.multiprocessing.set_sharing_strategy('file_system') # <--- ADD THIS LINE
+    torch.multiprocessing.set_sharing_strategy('file_system')
     
     # --- Reproducibility Setup ---
     seed = CONFIG['seed']
@@ -355,10 +378,9 @@ def main():
         dropout=CONFIG['dropout']
     ).to(device)
     
-    checkpoint_best = "gnn_a100_best.pth"
-    checkpoint_last = "gnn_a100_last.pth"
+    checkpoint_best = Path(CONFIG['checkpoints_dir']) / "gnn_a100_best.pth"
+    checkpoint_last = Path(CONFIG['checkpoints_dir']) / "gnn_a100_last.pth"
 
-    # Auto-detect device for AMP (fixes CUDA-only issue)
     scaler = torch.amp.GradScaler()
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
     criterion = nn.HuberLoss(delta=1.0) 
@@ -392,7 +414,6 @@ def main():
         best_val_rmse = checkpoint.get('best_val_rmse', float('inf'))
         early_stop_counter = checkpoint.get('early_stop_counter', 0)
         
-        # Fast-forward warmup
         if start_epoch > CONFIG['warmup_epochs']:
             for _ in range(CONFIG['warmup_epochs']): warmup_scheduler.step()
         
@@ -416,7 +437,6 @@ def main():
         else:
             plateau_scheduler.step(val_rmse)
 
-        # Clean Log Line
         log_msg = (f"Ep {epoch+1:03d} | LR {current_lr:.2e} | Train Loss {loss:.4f} | "
                    f"Val RMSE {val_rmse:.4f} | Val R2 {val_r2:.4f} | Val PCC {val_pcc:.4f}")
         logger.info(log_msg)
@@ -427,10 +447,9 @@ def main():
                 "val_rmse": val_rmse, "val_r2": val_r2, "val_pcc": val_pcc, "val_scc": val_scc
             })
 
-        # Save Logic
         state_dict = {
             'epoch': epoch,
-            'config': CONFIG, # <--- CRITICAL: SAVE CONFIG FOR INFERENCE
+            'config': CONFIG,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
@@ -442,7 +461,7 @@ def main():
         if val_rmse < best_val_rmse:
             best_val_rmse = val_rmse
             early_stop_counter = 0
-            torch.save(state_dict, checkpoint_best) # Save best with full state (safe)
+            torch.save(state_dict, checkpoint_best)
             logger.info(f"⭐ New Best Model Saved")
         else:
             early_stop_counter += 1

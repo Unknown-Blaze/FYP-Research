@@ -7,16 +7,15 @@ import pandas as pd
 import numpy as np
 import joblib
 import yaml
-import json
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
-from torch_geometric.data import Batch, Data
-from torch_geometric.nn import GATv2Conv
-from torch_geometric.utils import to_dense_batch
+from torch_geometric.data import Batch
+from torch_geometric.nn import GATv2Conv, GlobalAttention
 
 # ============================================================================
-# 1. MODEL DEFINITIONS (Must match your Training Script)
+# 1. MODEL DEFINITIONS (UPDATED TO MATCH UNIFIED GNN)
 # ============================================================================
+
 class MultiHeadAttentionFusion(nn.Module):
     def __init__(self, hidden_dim, num_heads=4, dropout=0.1):
         super().__init__()
@@ -31,50 +30,59 @@ class MultiHeadAttentionFusion(nn.Module):
         return self.norm(attn_output + query).squeeze(1)
 
 class EnsembleGraphNetwork(nn.Module):
-    def __init__(self, input_dim=23, hidden_dims=[512, 512, 512], num_heads=16, dropout=0.0):
+    def __init__(self, input_dim=6, hidden_dims=[256, 256, 256], num_heads=8, dropout=0.0):
         super().__init__()
-        self.dropout = dropout 
+        self.dropout = dropout
+        
+        # --- 1. GNN Backbone (Unified) ---
         dims = [input_dim] + hidden_dims
         self.gat_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.input_norm = nn.BatchNorm1d(input_dim)
         
         for i in range(len(dims) - 1):
-            self.gat_layers.append(GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, dropout=dropout, edge_dim=16))
+            self.gat_layers.append(
+                GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, 
+                          dropout=dropout, edge_dim=16, concat=True)
+            )
             self.norms.append(nn.LayerNorm(dims[i+1]))
             
         self.graph_dim = dims[-1]
-        self.mhc_to_pep_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        self.pep_to_mhc_attn = nn.MultiheadAttention(self.graph_dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        self.embedding_dim = 4 * self.graph_dim
-        self.fusion_module = MultiHeadAttentionFusion(self.embedding_dim, num_heads=num_heads)
-        self.fc_layers = nn.Sequential(
-            nn.Linear(self.embedding_dim, 1024), nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(1024, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(512, 1)
+
+        # --- 2. Interface-Aware Pooling ---
+        self.pool_gate = nn.Sequential(
+            nn.Linear(self.graph_dim, 1),
+            nn.Sigmoid()
         )
-    
-    def process_subgraph(self, x, edge_index, edge_attr):
-        x = self.input_norm(x)
+        self.global_pool = GlobalAttention(gate_nn=self.pool_gate)
+
+        # --- 3. Template Fusion ---
+        self.fusion_module = MultiHeadAttentionFusion(self.graph_dim, num_heads=num_heads)
+
+        # --- 4. Prediction Head ---
+        self.fc_layers = nn.Sequential(
+            nn.Linear(self.graph_dim, 128),
+            nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        
         for gat, norm in zip(self.gat_layers, self.norms):
             x_in = x
-            if edge_index.numel() > 0: x = gat(x, edge_index, edge_attr=edge_attr)
-            if x.shape[1] == x_in.shape[1]: x = x + x_in 
-            x = F.elu(norm(x)) 
-        return x
+            x = gat(x, edge_index, edge_attr=edge_attr)
+            if x.shape[1] == x_in.shape[1]: x = x + x_in
+            x = F.elu(norm(x))
 
-    def forward(self, mhc, pep):
-        mhc_feats = self.process_subgraph(mhc.x, mhc.edge_index, mhc.edge_attr)
-        pep_feats = self.process_subgraph(pep.x, pep.edge_index, pep.edge_attr)
-        mhc_dense, mhc_mask = to_dense_batch(mhc_feats, mhc.batch)
-        pep_dense, pep_mask = to_dense_batch(pep_feats, pep.batch)
-        pep_ctx, _ = self.pep_to_mhc_attn(pep_dense, mhc_dense, mhc_dense, key_padding_mask=~mhc_mask)
-        mhc_ctx, _ = self.mhc_to_pep_attn(mhc_dense, pep_dense, pep_dense, key_padding_mask=~pep_mask)
-        def masked_pool(t, m): return (t * m.unsqueeze(-1)).sum(1) / m.sum(1, keepdim=True).clamp(min=1)
-        combined = torch.cat([masked_pool(mhc_dense, mhc_mask), masked_pool(pep_dense, pep_mask),
-                              masked_pool(mhc_ctx, mhc_mask), masked_pool(pep_ctx, pep_mask)], dim=1)
-        fused = self.fusion_module(combined.view(-1, 4, combined.shape[-1]))
-        return self.fc_layers(fused).squeeze()
+        graph_embed = self.global_pool(x, batch)
+        
+        actual_batch_size = graph_embed.shape[0] // 4
+        templates_view = graph_embed.view(actual_batch_size, 4, -1)
+        fused_vec = self.fusion_module(templates_view)
+        
+        return self.fc_layers(fused_vec).squeeze()
 
 # ============================================================================
 # 2. CONFIGURATION
@@ -83,18 +91,16 @@ CONFIG = {
     'data_path': './iedb_dataset.csv', 
     'output_csv': 'ensemble_meta_data.csv',
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    
-    # Batch size can be larger for inference since no gradients are stored
     'batch_size': 128, 
     
-    # Model Paths
     'esm_ckpt': 'checkpoints/checkpoints_esm2_warmstart/best_model.pt',
     'esm_config': 'sequence/config.yaml',
     'esm_scaler': 'checkpoints/checkpoints_esm2_warmstart/label_scaler.joblib',
     
     'gnn_ckpt': './structure/gnn_a100_best.pth',
+    # Note: We now point to the Unified folder
     'gnn_mhc': './structure/data/graphs/ensemble/mhc',
-    'gnn_pep': './structure/data/graphs/ensemble/peptide'
+    'gnn_pep': './structure/data/graphs/ensemble/peptide' # (Unused but kept for class init)
 }
 
 # ============================================================================
@@ -131,28 +137,28 @@ def load_models(device):
     # 2. ESM Scaler
     try:
         scaler = joblib.load(CONFIG['esm_scaler'])
+        print("✅ ESM Scaler loaded.")
     except Exception:
+        print("⚠️ ESM Scaler NOT found.")
         scaler = None
 
     # 3. GNN Model
     print(f"⏳ Loading GNN from {CONFIG['gnn_ckpt']}...")
     ckpt = torch.load(CONFIG['gnn_ckpt'], map_location=device)
     
-    # Attempt to load saved config from checkpoint
     saved_conf = ckpt.get('config', None)
     if saved_conf:
-        print(f"✅ Found saved config. Hidden Dims: {saved_conf['hidden_dims']}")
+        print(f"✅ Config: Hidden={saved_conf['hidden_dims']}, Input={saved_conf.get('input_dim', 6)}")
         gnn_model = EnsembleGraphNetwork(
-            input_dim=saved_conf['input_dim'],
+            input_dim=saved_conf.get('input_dim', 6), # Default to 6 if missing
             hidden_dims=saved_conf['hidden_dims'], 
             num_heads=saved_conf['num_heads'],
-            dropout=0.0 # No dropout for inference
+            dropout=0.0
         ).to(device)
     else:
         print("⚠️ No config found. Using defaults.")
         gnn_model = EnsembleGraphNetwork().to(device)
 
-    # Load weights
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
     gnn_model.load_state_dict(state)
     gnn_model.eval()
@@ -160,7 +166,7 @@ def load_models(device):
     return esm_model, gnn_model, tokenizer, scaler
 
 # ============================================================================
-# 4. INFERENCE DATASET & COLLATE FIX
+# 4. INFERENCE DATASET & COLLATE FIX (UPDATED FOR UNIFIED GRAPH)
 # ============================================================================
 class InferenceDataset(Dataset):
     def __init__(self, df, gnn_ds, tokenizer):
@@ -170,30 +176,32 @@ class InferenceDataset(Dataset):
     def __len__(self): return len(self.df)
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        # Get graph data (returns Batch, Batch, target)
-        mhc_graph, pep_graph, target = self.gnn_ds[idx]
+        
+        # CHANGED: Dataset now returns (Unified_Graph_Batch, Target)
+        # We unpack it carefully
+        graph_batch, target = self.gnn_ds[idx]
         
         mhc_seq = row['mhc_sequence'] 
         pep_seq = row['peptide'] 
         plddt = row.get('mean_plddt', 0.0) 
         if pd.isna(plddt): plddt = 0.0
         
-        return mhc_seq, pep_seq, mhc_graph, pep_graph, target, len(pep_seq), float(plddt)
+        return mhc_seq, pep_seq, graph_batch, target, len(pep_seq), float(plddt)
 
 def collate_wrapper(batch, tokenizer):
-    # Unpack the list of tuples
-    mhc_seqs, pep_seqs, mhc_graphs_list, pep_graphs_list, targets, lens, plddts = zip(*batch)
+    # Unpack
+    mhc_seqs, pep_seqs, graph_batches, targets, lens, plddts = zip(*batch)
     
     # Tokenize Sequences
     mhc_tok = tokenizer(list(mhc_seqs), return_tensors='pt', padding='max_length', max_length=512, truncation=True)
     pep_tok = tokenizer(list(pep_seqs), return_tensors='pt', padding='max_length', max_length=512, truncation=True)
     
-    # --- CRITICAL FIX: Re-batch the graphs ---
-    # Convert tuple of Batch objects -> Single Super-Batch object
-    mhc_batch_graph = Batch.from_data_list(list(mhc_graphs_list))
-    pep_batch_graph = Batch.from_data_list(list(pep_graphs_list))
+    # CHANGED: Re-batch the unified graphs
+    # Since 'graph_batches' are already Batch objects (containing 4 templates),
+    # we use Batch.from_data_list again to merge them into a super-batch
+    unified_batch_graph = Batch.from_data_list(list(graph_batches))
     
-    return mhc_tok, pep_tok, mhc_batch_graph, pep_batch_graph, torch.tensor(targets), lens, plddts
+    return mhc_tok, pep_tok, unified_batch_graph, torch.tensor(targets), lens, plddts
 
 # ============================================================================
 # 5. MAIN EXECUTION
@@ -208,7 +216,6 @@ def main():
     # Initialize GNN Dataset
     gnn_ds = EnsembleDataset(df, CONFIG['gnn_mhc'], CONFIG['gnn_pep'], label_col='binding_affinity_nM')
     
-    # Inference Loader
     dataset = InferenceDataset(df, gnn_ds, tokenizer)
     loader = DataLoader(
         dataset, 
@@ -224,33 +231,32 @@ def main():
     
     for batch in tqdm(loader):
         try:
-            mhc_tok, pep_tok, mhc_graph, pep_graph, targets, lens, plddts = batch
+            # CHANGED: Unpack Unified Graph
+            mhc_tok, pep_tok, unified_graph, targets, lens, plddts = batch
             
-            # Move to device
             esm_batch_mhc = {k: v.to(device) for k, v in mhc_tok.items()}
             esm_batch_pep = {k: v.to(device) for k, v in pep_tok.items()}
-            mhc_graph = mhc_graph.to(device)
-            pep_graph = pep_graph.to(device)
+            unified_graph = unified_graph.to(device)
             
             with torch.no_grad():
                 # 1. ESM Prediction
                 esm_raw = esm_model(esm_batch_mhc, esm_batch_pep)
-                # Robust inverse transform using the saved scaler (supports StandardScaler/MinMaxScaler)
+                
+                # --- SCALING CHECK ---
                 if scaler is not None:
+                    # Inverse transform back to pIC50
                     esm_pred_np = scaler.inverse_transform(esm_raw.detach().cpu().reshape(-1, 1)).reshape(-1)
                     esm_pred = torch.from_numpy(esm_pred_np).to(device)
                 else:
                     esm_pred = esm_raw.squeeze()
                 
-                # 2. GNN Prediction
-                gnn_pred = gnn_model(mhc_graph, pep_graph)
+                # 2. GNN Prediction (CHANGED: Pass Unified Graph)
+                gnn_pred = gnn_model(unified_graph)
             
-            # Convert to CPU lists
             esm_vals = esm_pred.squeeze().cpu().tolist()
             gnn_vals = gnn_pred.squeeze().cpu().tolist()
             target_vals = targets.tolist()
             
-            # Handle single-item batches
             if not isinstance(esm_vals, list): esm_vals = [esm_vals]
             if not isinstance(gnn_vals, list): gnn_vals = [gnn_vals]
             
@@ -268,7 +274,6 @@ def main():
             print(f"⚠️ Batch Error: {e}")
             continue
 
-    # Save Results
     pd.DataFrame(results).to_csv(CONFIG['output_csv'], index=False)
     print(f"✅ Ensemble Training Data Saved to {CONFIG['output_csv']}")
 
