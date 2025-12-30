@@ -43,8 +43,8 @@ CONFIG = {
     'logs_dir': 'logs',           # <--- New folder for logs
     'checkpoints_dir': 'checkpoints', # <--- New folder for models
     
-    'batch_size': 128,
-    'grad_accum_steps': 4,          
+    'batch_size': 32,
+    'grad_accum_steps': 16,          
     'num_epochs': 150,        
     'learning_rate': 3e-4,        
     'warmup_epochs': 10,          
@@ -96,13 +96,8 @@ def rbf_expansion(distances, num_centers=16, cutoff=10.0):
 class EnsembleDataset(Dataset):
     def __init__(self, df, graphs_dir_mhc, graphs_dir_peptide, label_col='binding_affinity_nM'):
         self.df = df.copy()
-        # We only need one directory now since the graph is unified
         self.graphs_dir = Path(graphs_dir_mhc) 
-        
-        if label_col not in self.df.columns and 'IC50' in self.df.columns:
-            self.label_col = 'IC50'
-        else:
-            self.label_col = label_col
+        self.label_col = label_col if label_col in self.df.columns else 'IC50'
 
     def __len__(self):
         return len(self.df)
@@ -112,56 +107,60 @@ class EnsembleDataset(Dataset):
         graph_list = []
         
         for t in range(4):
-            # We look for the file we saved in Step 1
             file_id = f"{row.name}_T{t}.pt"
             path = self.graphs_dir / file_id
             
             try:
-                # LOAD UNIFIED GRAPH
+                # 1. LOAD GRAPH
                 graph = torch.load(path)
-                                
-                # Safety check for labels
-                if hasattr(graph, 'y'): del graph.y
+                
+                # 2. EXTRACT SIMILARITY SAFELY
+                if hasattr(graph, 'identity'):
+                    sim_val = float(graph.identity)
+                else:
+                    sim_val = 0.0 # Default/Fallback
+                
+                # --- NEW: Attach as a Tensor Property ---
+                # This ensures PyTorch stacks it into [Batch, 1] automatically
+                graph.sim_score = torch.tensor([sim_val], dtype=torch.float32)
 
-                # --- SANITY CHECK 1: Prune Bad Edges (Fixes "device-side assert") ---
+                # 3. CLEANUP
+                if hasattr(graph, 'y'): del graph.y
+                if hasattr(graph, 'identity'): del graph.identity # Remove original key
+
                 num_nodes = graph.x.size(0)
+                # Fix edges
                 if graph.edge_index.numel() > 0:
                     mask = (graph.edge_index[0] < num_nodes) & (graph.edge_index[1] < num_nodes)
                     graph.edge_index = graph.edge_index[:, mask]
                     if graph.edge_attr is not None:
                         graph.edge_attr = graph.edge_attr[mask]
-                # --------------------------------------------------------------------
 
-                # --- FIX PART 1: Force chain_mask to be BOOL ---
+                # Fix mask
                 if hasattr(graph, 'chain_mask'):
-                    # If it exists, FORCE convert to bool (fixes the crash)
                     graph.chain_mask = graph.chain_mask.bool()
                 else:
-                    # If missing, create default boolean mask
                     graph.chain_mask = torch.ones(num_nodes, dtype=torch.bool)
-                # ------------------------------------------------
                 
             except (FileNotFoundError, Exception):
-                # Create dummy if missing
+                # Dummy Graph
                 dummy_x = torch.zeros((1, CONFIG['input_dim']), dtype=torch.float32)
                 dummy_pos = torch.zeros((1, 3), dtype=torch.float32)
                 dummy_edge = torch.zeros((2, 0), dtype=torch.long)
                 dummy_attr = torch.zeros((0, 16), dtype=torch.float32)
                 
-                # --- FIX PART 2: Dummy mask must also be BOOL ---
-                dummy_mask = torch.zeros(1, dtype=torch.bool)
-                # ------------------------------------------------
-
-                # Important: Add batch attribute AND chain_mask for dummy
                 graph = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, 
                              edge_attr=dummy_attr, batch=torch.zeros(1).long(),
-                             chain_mask=dummy_mask) 
+                             chain_mask=torch.zeros(1, dtype=torch.bool))
+                
+                # Attach Dummy Score
+                graph.sim_score = torch.tensor([0.0], dtype=torch.float32)
 
             graph_list.append(graph)
 
-        # Create the Batch
+        # Create Batch
         batch = Batch.from_data_list(graph_list)
-
+        
         try:
             val = float(row[self.label_col])
             val = min(val, 50000.0)
@@ -169,9 +168,7 @@ class EnsembleDataset(Dataset):
         except:
             target = 0.0
 
-        # RETURN ONLY ONE BATCH OBJECT + TARGET
         return batch, float(target)
-
 # ============================================================================
 # 3. Model
 # ============================================================================
@@ -194,13 +191,12 @@ class EnsembleGraphNetwork(nn.Module):
         super().__init__()
         self.dropout = dropout
         
-        # --- 1. GNN Backbone (Unified) ---
+        # --- 1. GNN Backbone ---
         dims = [input_dim] + hidden_dims
         self.gat_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         
         for i in range(len(dims) - 1):
-            # Edge dim is 16 (for the RBF distances)
             self.gat_layers.append(
                 GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, 
                           dropout=dropout, edge_dim=16, concat=True)
@@ -209,13 +205,21 @@ class EnsembleGraphNetwork(nn.Module):
             
         self.graph_dim = dims[-1]
 
-        # --- 2. Interface-Aware Pooling ---
-        # Instead of averaging everything, this learns WHICH nodes are important
+        # --- 2. Pooling ---
         self.pool_gate = nn.Sequential(
             nn.Linear(self.graph_dim, 1),
             nn.Sigmoid()
         )
         self.global_pool = GlobalAttention(gate_nn=self.pool_gate)
+
+        # --- NEW: Similarity Injection ---
+        # We will concat the graph embedding (512) with the similarity score (1)
+        # Then project back to 512
+        self.sim_proj = nn.Sequential(
+            nn.Linear(self.graph_dim + 1, self.graph_dim),
+            nn.LayerNorm(self.graph_dim),
+            nn.ReLU()
+        )
 
         # --- 3. Template Fusion ---
         self.fusion_module = MultiHeadAttentionFusion(self.graph_dim, num_heads=num_heads)
@@ -228,36 +232,46 @@ class EnsembleGraphNetwork(nn.Module):
             nn.LayerNorm(64), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
+        
+        # --- UPGRADE 1: THE BIAS TRICK ---
+        # Initialize final bias to 6.0 (approx mean pIC50)
+        self.fc_layers[-1].bias.data.fill_(6.0)
 
     def forward(self, data):
-        # NOTE: Input is now a SINGLE unified graph object 'data'
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         
-        # 1. Message Passing (Physics happens here!)
+        # Capture similarity scores
+        sim_scores = data.sim_score 
+
+        # 1. GNN
         for gat, norm in zip(self.gat_layers, self.norms):
             x_in = x
             x = gat(x, edge_index, edge_attr=edge_attr)
-            
-            # Residual connection (if dimensions match)
-            if x.shape[1] == x_in.shape[1]:
-                x = x + x_in
-            
+            if x.shape[1] == x_in.shape[1]: x = x + x_in
             x = norm(x)
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # 2. Pooling (Extract Interaction Signal)
+        # 2. Pooling -> [Batch*4, 512]
         graph_embed = self.global_pool(x, batch)
         
-        # 3. Template Fusion
+        # --- FIX: Ensure dimensions match for concatenation ---
+        if sim_scores.dim() == 1:
+            sim_scores = sim_scores.unsqueeze(1)
+        # ----------------------------------------------------
+
+        # --- UPGRADE 2: INJECT SIMILARITY ---
+        combined = torch.cat([graph_embed, sim_scores], dim=1) 
+        graph_embed = self.sim_proj(combined)
+        # ------------------------------------
+
+        # 3. Fusion
         actual_batch_size = graph_embed.shape[0] // 4
         templates_view = graph_embed.view(actual_batch_size, 4, -1)
-        
         fused_vec = self.fusion_module(templates_view)
         
-        # 4. Final Regression
         return self.fc_layers(fused_vec).squeeze()
-
+    
 # ============================================================================
 # 4. Optimized Training Loop
 # ============================================================================
@@ -301,9 +315,9 @@ def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_cl
 def evaluate(model, loader, device):
     model.eval()
     preds, actuals = [], []
-    
+    all_sims = [] # To store identity scores
+
     with torch.no_grad():
-        # --- FIX 2: Updated loop to match new dataset (data, y) ---
         for data, y in loader:
             data = data.to(device)
             y = y.to(device)
@@ -312,6 +326,12 @@ def evaluate(model, loader, device):
             
             preds.extend(pred.cpu().numpy())
             actuals.extend(y.cpu().numpy())
+            
+            # EXTRACT SIMILARITIES FOR LOGGING
+            if hasattr(data, 'similarities'):
+                # Reshape flattened [Batch*4] back to [Batch, 4]
+                sims = data.similarities.view(-1, 4).cpu().numpy()
+                all_sims.append(sims)
     
     if not preds: return 0, 0, 0, 0
     
@@ -323,6 +343,12 @@ def evaluate(model, loader, device):
     pcc, _ = pearsonr(actuals, preds)
     scc, _ = spearmanr(actuals, preds)
     
+    # PRINT IDENTITY STATS
+    if all_sims:
+        all_sims = np.vstack(all_sims)
+        avg_sim = np.mean(all_sims, axis=0) * 100
+        print(f"\n[Validation] Avg Template Identity: T0:{avg_sim[0]:.1f}% | T1:{avg_sim[1]:.1f}% | T2:{avg_sim[2]:.1f}% | T3:{avg_sim[3]:.1f}%")
+
     return rmse, r2, pcc, scc
 
 def seed_worker(worker_id):

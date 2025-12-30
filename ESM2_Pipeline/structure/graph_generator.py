@@ -111,7 +111,7 @@ def create_unified_interaction_graph(mhc_seq, pep_seq, mhc_template, pep_templat
     # Using SequenceMatcher to get % Identity (0.0 to 1.0)
     # This tells the model: "How confident should I be in this structure?"
     if mhc_template['seq']:
-        sim_mhc = difflib.SequenceMatcher(None, mhc_seq, mhc_template['seq']).ratio()
+        sim_mhc = difflib.SequenceMatcher(None, mhc_seq, mhc_template['seq'], autojunk=False).ratio()
     else:
         sim_mhc = 0.0
     # ------------------------------------------------
@@ -155,38 +155,33 @@ def create_unified_interaction_graph(mhc_seq, pep_seq, mhc_template, pep_templat
     return data
 
 def main():
-    # 1. Load Templates (Coords + Sequences)
+    # 1. Load Templates
     templates_cache = []
     print("Loading Templates and Extracting Sequences...")
     for t_file in TEMPLATE_FILES:
         path = os.path.join(TEMPLATE_DIR, t_file)
         if os.path.exists(path):
             mhc_data, pep_data = load_template_data(path)
-            # Only add if valid
-            if len(mhc_data['coords']) > 0 and len(pep_data['coords']) > 0:
+            if len(mhc_data['coords']) > 0:
                 templates_cache.append((mhc_data, pep_data))
-            else:
-                print(f"Skipping {t_file} (Parsing failed or empty chains)")
-        else:
-            print(f"Warning: {t_file} not found!")
-
+    
     if not templates_cache:
-        print("CRITICAL: No valid templates loaded. Exiting.")
+        print("CRITICAL: No valid templates loaded.")
         return
 
     # 2. Process CSV
-    csv_path = "../iedb_dataset.csv"
-    if not os.path.exists(csv_path):
-        print("Error: CSV not found")
-        return
-
-    df = pd.read_csv(csv_path)
-    # Clean Data
-    df = df.dropna(subset=['mhc_sequence', 'peptide', 'binding_affinity_nM'])
+    df = pd.read_csv("../iedb_dataset.csv").dropna(subset=['mhc_sequence', 'peptide', 'binding_affinity_nM'])
     
+    # --- NEW LIST TO STORE LOGS ---
+    similarity_logs = []
+    # ------------------------------
+
     print(f"Threading {len(df)} samples against {len(templates_cache)} templates...")
     
     for idx, row in tqdm(df.iterrows(), total=len(df)):
+        # Store scores for this specific row
+        row_scores = {'original_index': idx, 'mhc_sequence': row['mhc_sequence']}
+        
         for t_idx, (mhc_template, pep_template) in enumerate(templates_cache):
             try:
                 # Returns ONE unified object
@@ -198,13 +193,28 @@ def main():
                     row['binding_affinity_nM']
                 )
                 
-                # Save
+                # Save Graph
                 torch.save(unified_graph, OUT_DIR / "mhc" / f"{idx}_T{t_idx}.pt")
                 
+                # --- LOG THE SCORE ---
+                # Retrieve the score we just calculated inside the function
+                score = float(unified_graph.identity)
+                row_scores[f'T{t_idx}_identity'] = score
+                # ---------------------
+                
             except Exception as e:
-                # Useful for debugging but don't crash
-                # print(f"Error on row {idx}: {e}")
-                pass 
+                row_scores[f'T{t_idx}_identity'] = 0.0 # Log failure as 0
+
+        similarity_logs.append(row_scores)
+
+        # Optional: Save every 10,000 rows to avoid memory crash
+        if len(similarity_logs) % 10000 == 0:
+             pd.DataFrame(similarity_logs).to_csv(OUT_DIR / "similarity_metadata_partial.csv", index=False)
+
+    # --- SAVE FINAL CSV ---
+    metadata_df = pd.DataFrame(similarity_logs)
+    metadata_df.to_csv(OUT_DIR / "similarity_metadata.csv", index=False)
+    print(f"Saved similarity logs to {OUT_DIR / 'similarity_metadata.csv'}")
 
 if __name__ == "__main__":
     main()
