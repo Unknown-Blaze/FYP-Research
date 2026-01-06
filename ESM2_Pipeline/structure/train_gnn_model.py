@@ -1,7 +1,7 @@
 """
 Graph Neural Network for MHC-Peptide Binding Affinity Prediction
-(Multi-Template Ensemble Architecture - MIL-GNN)
-TARGET: NVIDIA A100 OPTIMIZED (512-dim, 16 heads)
+(Physics-Enhanced Multi-Template Ensemble)
+TARGET: NVIDIA A100 OPTIMIZED
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -12,9 +12,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# --- FIX 1: Added GlobalAttention import ---
 from torch_geometric.nn import GATv2Conv, GlobalAttention
-from torch_geometric.utils import to_dense_batch
 from torch_geometric.loader import DataLoader 
 from torch_geometric.data import Data, Batch 
 from torch.utils.data import Dataset
@@ -25,23 +23,24 @@ from scipy.stats import pearsonr, spearmanr
 import logging
 from datetime import datetime
 import sys
-import json
 import gc
 from tqdm import tqdm
 
 # ============================================================================
-# 1. Configuration (A100 TUNED)
+# 1. Configuration (PHYSICS UPDATED)
 # ============================================================================
 
 CONFIG = {
-    'input_dim': 6,  
+    # --- PHYSICS UPDATES ---
+    'input_dim': 30,  # 25 Seq + 5 Physics
+    'edge_dim': 18,   # 16 RBF + 1 Ori + 1 Dist
+    # -----------------------
+
     'dataset_path': '../iedb_dataset.csv',
     'graphs_dir_mhc': 'data/graphs/ensemble/mhc',
     'graphs_dir_peptide': 'data/graphs/ensemble/peptide',
-    
-    # --- NEW: ORGANIZATION PATHS ---
-    'logs_dir': 'logs',           # <--- New folder for logs
-    'checkpoints_dir': 'checkpoints', # <--- New folder for models
+    'logs_dir': 'logs',
+    'checkpoints_dir': 'checkpoints',
     
     'batch_size': 32,
     'grad_accum_steps': 16,          
@@ -57,7 +56,7 @@ CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
-# Create directories immediately
+# Ensure directories exist
 Path(CONFIG['logs_dir']).mkdir(parents=True, exist_ok=True)
 Path(CONFIG['checkpoints_dir']).mkdir(parents=True, exist_ok=True)
 
@@ -66,41 +65,45 @@ Path(CONFIG['checkpoints_dir']).mkdir(parents=True, exist_ok=True)
 # ============================================================================
 
 USE_WANDB = False 
+if USE_WANDB: import wandb
 
-if USE_WANDB:
-    import wandb
-
-# CHANGE: Path joins the directory with the filename
-log_file = Path(CONFIG['logs_dir']) / f"gnn_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+log_file = Path(CONFIG['logs_dir']) / f"gnn_physics_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# 2. Dataset & Helper Functions
+# 2. Dataset (Compatible with New Graph Gen)
 # ============================================================================
-
-def rbf_expansion(distances, num_centers=16, cutoff=10.0):
-    centers = torch.linspace(0, cutoff, num_centers, device=distances.device)
-    width = centers[1] - centers[0]
-    return torch.exp(-((distances.unsqueeze(-1) - centers) ** 2) / width)
 
 class EnsembleDataset(Dataset):
     def __init__(self, df, graphs_dir_mhc, graphs_dir_peptide, label_col='binding_affinity_nM'):
         self.df = df.copy()
         self.graphs_dir = Path(graphs_dir_mhc) 
         self.label_col = label_col if label_col in self.df.columns else 'IC50'
+        self.warned = False 
 
     def __len__(self):
         return len(self.df)
+        
+    def _get_dummy(self):
+        """Returns a safe, zero-filled graph of the CORRECT dimensions"""
+        # Dynamic check ensures it matches whatever you set in CONFIG
+        dummy_x = torch.zeros((1, CONFIG['input_dim']), dtype=torch.float32)
+        dummy_pos = torch.zeros((1, 3), dtype=torch.float32) # Standard coords
+        dummy_edge = torch.zeros((2, 0), dtype=torch.long)
+        dummy_attr = torch.zeros((0, CONFIG['edge_dim']), dtype=torch.float32) 
+        
+        graph = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, 
+                     edge_attr=dummy_attr, batch=torch.zeros(1).long(),
+                     chain_mask=torch.zeros(1, dtype=torch.bool))
+        graph.sim_score = torch.tensor([0.0], dtype=torch.float32)
+        return graph
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -111,54 +114,57 @@ class EnsembleDataset(Dataset):
             path = self.graphs_dir / file_id
             
             try:
-                # 1. LOAD GRAPH
                 graph = torch.load(path)
                 
-                # 2. EXTRACT SIMILARITY SAFELY
+                # --- DEFENSIVE CHECKS ---
+                is_valid = True
+                
+                # 1. Check Dimensions
+                if graph.x.shape[1] != CONFIG['input_dim']:
+                    is_valid = False
+                
+                # 2. Check Coordinates (The Fix for KeyError: 'pos')
+                # We simply check if 'pos' exists in the keys
+                if 'pos' not in graph:
+                    is_valid = False
+
+                if not is_valid:
+                    if not self.warned:
+                        print(f"⚠️  Filtering corrupt data (Dim mismatch or missing 'pos'). Replacing with dummy.")
+                        self.warned = True
+                    graph = self._get_dummy()
+                # ------------------------
+
+                # Handle Similarity Score
                 if hasattr(graph, 'identity'):
                     sim_val = float(graph.identity)
                 else:
-                    sim_val = 0.0 # Default/Fallback
-                
-                # --- NEW: Attach as a Tensor Property ---
-                # This ensures PyTorch stacks it into [Batch, 1] automatically
+                    sim_val = 0.0
                 graph.sim_score = torch.tensor([sim_val], dtype=torch.float32)
 
-                # 3. CLEANUP
+                # Cleanup
                 if hasattr(graph, 'y'): del graph.y
-                if hasattr(graph, 'identity'): del graph.identity # Remove original key
+                if hasattr(graph, 'identity'): del graph.identity 
 
+                # Safety: Clip Edges
                 num_nodes = graph.x.size(0)
-                # Fix edges
                 if graph.edge_index.numel() > 0:
                     mask = (graph.edge_index[0] < num_nodes) & (graph.edge_index[1] < num_nodes)
                     graph.edge_index = graph.edge_index[:, mask]
                     if graph.edge_attr is not None:
                         graph.edge_attr = graph.edge_attr[mask]
 
-                # Fix mask
-                if hasattr(graph, 'chain_mask'):
-                    graph.chain_mask = graph.chain_mask.bool()
-                else:
+                # Safety: Mask
+                if not hasattr(graph, 'chain_mask'):
                     graph.chain_mask = torch.ones(num_nodes, dtype=torch.bool)
+                else:
+                    graph.chain_mask = graph.chain_mask.bool()
                 
             except (FileNotFoundError, Exception):
-                # Dummy Graph
-                dummy_x = torch.zeros((1, CONFIG['input_dim']), dtype=torch.float32)
-                dummy_pos = torch.zeros((1, 3), dtype=torch.float32)
-                dummy_edge = torch.zeros((2, 0), dtype=torch.long)
-                dummy_attr = torch.zeros((0, 16), dtype=torch.float32)
-                
-                graph = Data(x=dummy_x, pos=dummy_pos, edge_index=dummy_edge, 
-                             edge_attr=dummy_attr, batch=torch.zeros(1).long(),
-                             chain_mask=torch.zeros(1, dtype=torch.bool))
-                
-                # Attach Dummy Score
-                graph.sim_score = torch.tensor([0.0], dtype=torch.float32)
+                graph = self._get_dummy()
 
             graph_list.append(graph)
 
-        # Create Batch
         batch = Batch.from_data_list(graph_list)
         
         try:
@@ -169,8 +175,9 @@ class EnsembleDataset(Dataset):
             target = 0.0
 
         return batch, float(target)
+    
 # ============================================================================
-# 3. Model
+# 3. Model Architecture (UPDATED)
 # ============================================================================
 
 class MultiHeadAttentionFusion(nn.Module):
@@ -187,7 +194,7 @@ class MultiHeadAttentionFusion(nn.Module):
         return self.norm(attn_output + query).squeeze(1)
 
 class EnsembleGraphNetwork(nn.Module):
-    def __init__(self, input_dim=6, hidden_dims=[256, 256, 256], num_heads=8, dropout=0.3):
+    def __init__(self, input_dim=31, edge_dim=18, hidden_dims=[512, 512, 512], num_heads=16, dropout=0.3):
         super().__init__()
         self.dropout = dropout
         
@@ -198,33 +205,34 @@ class EnsembleGraphNetwork(nn.Module):
         
         for i in range(len(dims) - 1):
             self.gat_layers.append(
-                GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, 
-                          dropout=dropout, edge_dim=16, concat=True)
+                GATv2Conv(
+                    dims[i], 
+                    dims[i+1]//num_heads, 
+                    heads=num_heads, 
+                    dropout=dropout, 
+                    edge_dim=edge_dim,  # <--- PHYSICS UPDATE
+                    concat=True
+                )
             )
             self.norms.append(nn.LayerNorm(dims[i+1]))
             
         self.graph_dim = dims[-1]
 
         # --- 2. Pooling ---
-        self.pool_gate = nn.Sequential(
-            nn.Linear(self.graph_dim, 1),
-            nn.Sigmoid()
-        )
+        self.pool_gate = nn.Sequential(nn.Linear(self.graph_dim, 1), nn.Sigmoid())
         self.global_pool = GlobalAttention(gate_nn=self.pool_gate)
 
-        # --- NEW: Similarity Injection ---
-        # We will concat the graph embedding (512) with the similarity score (1)
-        # Then project back to 512
+        # --- 3. Similarity Injection ---
         self.sim_proj = nn.Sequential(
             nn.Linear(self.graph_dim + 1, self.graph_dim),
             nn.LayerNorm(self.graph_dim),
             nn.ReLU()
         )
 
-        # --- 3. Template Fusion ---
+        # --- 4. Template Fusion ---
         self.fusion_module = MultiHeadAttentionFusion(self.graph_dim, num_heads=num_heads)
 
-        # --- 4. Prediction Head ---
+        # --- 5. Prediction Head ---
         self.fc_layers = nn.Sequential(
             nn.Linear(self.graph_dim, 128),
             nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
@@ -232,15 +240,10 @@ class EnsembleGraphNetwork(nn.Module):
             nn.LayerNorm(64), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
-        
-        # --- UPGRADE 1: THE BIAS TRICK ---
-        # Initialize final bias to 6.0 (approx mean pIC50)
         self.fc_layers[-1].bias.data.fill_(6.0)
 
     def forward(self, data):
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
-        
-        # Capture similarity scores
         sim_scores = data.sim_score 
 
         # 1. GNN
@@ -252,28 +255,23 @@ class EnsembleGraphNetwork(nn.Module):
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # 2. Pooling -> [Batch*4, 512]
+        # 2. Pooling
         graph_embed = self.global_pool(x, batch)
         
-        # --- FIX: Ensure dimensions match for concatenation ---
-        if sim_scores.dim() == 1:
-            sim_scores = sim_scores.unsqueeze(1)
-        # ----------------------------------------------------
-
-        # --- UPGRADE 2: INJECT SIMILARITY ---
+        # 3. Inject Similarity
+        if sim_scores.dim() == 1: sim_scores = sim_scores.unsqueeze(1)
         combined = torch.cat([graph_embed, sim_scores], dim=1) 
         graph_embed = self.sim_proj(combined)
-        # ------------------------------------
 
-        # 3. Fusion
+        # 4. Fusion
         actual_batch_size = graph_embed.shape[0] // 4
         templates_view = graph_embed.view(actual_batch_size, 4, -1)
         fused_vec = self.fusion_module(templates_view)
         
         return self.fc_layers(fused_vec).squeeze()
-    
+
 # ============================================================================
-# 4. Optimized Training Loop
+# 4. Robust Training Loop (Restored Full Features)
 # ============================================================================
 
 def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_clip_norm):
@@ -283,16 +281,18 @@ def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_cl
     pbar = tqdm(loader, desc="Training", leave=False, dynamic_ncols=True)
     accum_steps = CONFIG.get('grad_accum_steps', 1)
     
-    # Correct: Unpack only 2 items
     for i, (data, y) in enumerate(pbar):
         data = data.to(device)
         y = y.to(device)
         
+        # --- FIX IS HERE ---
+        # Only check max() if there are actually edges to check!
         num_nodes = data.x.size(0)
-        if data.edge_index.max() >= num_nodes:
+        if data.edge_index.numel() > 0 and data.edge_index.max() >= num_nodes:
             print(f"Skipping Bad Batch! Max edge index {data.edge_index.max()} >= Num nodes {num_nodes}")
             continue
-        
+        # -------------------
+
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             pred = model(data)
             loss = criterion(pred, y.float())
@@ -315,40 +315,20 @@ def train_epoch_amp(model, loader, optimizer, criterion, device, scaler, grad_cl
 def evaluate(model, loader, device):
     model.eval()
     preds, actuals = [], []
-    all_sims = [] # To store identity scores
-
     with torch.no_grad():
         for data, y in loader:
             data = data.to(device)
-            y = y.to(device)
-            
             pred = model(data)
-            
             preds.extend(pred.cpu().numpy())
             actuals.extend(y.cpu().numpy())
-            
-            # EXTRACT SIMILARITIES FOR LOGGING
-            if hasattr(data, 'similarities'):
-                # Reshape flattened [Batch*4] back to [Batch, 4]
-                sims = data.similarities.view(-1, 4).cpu().numpy()
-                all_sims.append(sims)
     
     if not preds: return 0, 0, 0, 0
-    
-    preds = np.array(preds)
-    actuals = np.array(actuals)
+    preds, actuals = np.array(preds), np.array(actuals)
     
     rmse = np.sqrt(mean_squared_error(actuals, preds))
     r2 = r2_score(actuals, preds)
     pcc, _ = pearsonr(actuals, preds)
     scc, _ = spearmanr(actuals, preds)
-    
-    # PRINT IDENTITY STATS
-    if all_sims:
-        all_sims = np.vstack(all_sims)
-        avg_sim = np.mean(all_sims, axis=0) * 100
-        print(f"\n[Validation] Avg Template Identity: T0:{avg_sim[0]:.1f}% | T1:{avg_sim[1]:.1f}% | T2:{avg_sim[2]:.1f}% | T3:{avg_sim[3]:.1f}%")
-
     return rmse, r2, pcc, scc
 
 def seed_worker(worker_id):
@@ -357,7 +337,6 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 def main():
-    
     import torch.multiprocessing
     torch.multiprocessing.set_sharing_strategy('file_system')
     
@@ -372,7 +351,7 @@ def main():
     g_seed.manual_seed(seed)
 
     if USE_WANDB:
-        wandb.init(project="MHC-GNN-Ensemble", config=CONFIG, name=f"run_{datetime.now().strftime('%m%d_%H%M')}")
+        wandb.init(project="MHC-GNN-Physics", config=CONFIG, name=f"run_phys_{datetime.now().strftime('%m%d_%H%M')}")
 
     logger.info("Initializing Data...")
     df = pd.read_csv(CONFIG['dataset_path'])
@@ -382,8 +361,6 @@ def main():
     train_df, test_df = train_test_split(df, test_size=0.15, random_state=CONFIG['seed'])
     train_ds = EnsembleDataset(train_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     test_ds = EnsembleDataset(test_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
-    
-    logger.info(f"Train Size: {len(train_df)} | Test Size: {len(test_df)}")
     
     train_loader = DataLoader(
         train_ds, batch_size=CONFIG['batch_size'], shuffle=True, 
@@ -399,18 +376,20 @@ def main():
     device = torch.device(CONFIG['device'])
     model = EnsembleGraphNetwork(
         input_dim=CONFIG['input_dim'],
+        edge_dim=CONFIG['edge_dim'],
         hidden_dims=CONFIG['hidden_dims'], 
         num_heads=CONFIG['num_heads'],
         dropout=CONFIG['dropout']
     ).to(device)
     
-    checkpoint_best = Path(CONFIG['checkpoints_dir']) / "gnn_a100_best.pth"
-    checkpoint_last = Path(CONFIG['checkpoints_dir']) / "gnn_a100_last.pth"
+    checkpoint_best = Path(CONFIG['checkpoints_dir']) / "gnn_physics_best.pth"
+    checkpoint_last = Path(CONFIG['checkpoints_dir']) / "gnn_physics_last.pth"
 
     scaler = torch.amp.GradScaler()
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
     criterion = nn.HuberLoss(delta=1.0) 
     
+    # --- SCHEDULERS RESTORED ---
     def lr_lambda(epoch):
         if epoch < CONFIG['warmup_epochs']:
             return float(epoch + 1) / float(CONFIG['warmup_epochs'])
@@ -421,7 +400,7 @@ def main():
         optimizer, mode='min', factor=0.5, patience=5, verbose=True
     )
 
-    # --- RESUMPTION LOGIC ---
+    # --- RESUMPTION LOGIC RESTORED ---
     start_epoch = 0
     best_val_rmse = float('inf')
     early_stop_counter = 0
@@ -440,24 +419,28 @@ def main():
         best_val_rmse = checkpoint.get('best_val_rmse', float('inf'))
         early_stop_counter = checkpoint.get('early_stop_counter', 0)
         
+        # Fast-forward warmup if needed
         if start_epoch > CONFIG['warmup_epochs']:
             for _ in range(CONFIG['warmup_epochs']): warmup_scheduler.step()
         
         logger.info(f"⏩ Resumed at Epoch {start_epoch} (Best RMSE: {best_val_rmse:.4f})")
     else:
-        logger.info("🚀 Starting FRESH training on A100...")
+        logger.info("🚀 Starting FRESH training...")
 
     patience = 20
 
+    # --- MAIN LOOP ---
     for epoch in range(start_epoch, CONFIG['num_epochs']):
         current_lr = optimizer.param_groups[0]['lr']
         
+        # Garbage Collection (Restored)
         gc.collect()
         torch.cuda.empty_cache()
         
         loss = train_epoch_amp(model, train_loader, optimizer, criterion, device, scaler, CONFIG['grad_clip_norm'])
         val_rmse, val_r2, val_pcc, val_scc = evaluate(model, test_loader, device)
         
+        # Scheduler Steps
         if epoch < CONFIG['warmup_epochs']:
             warmup_scheduler.step()
         else:
@@ -470,9 +453,10 @@ def main():
         if USE_WANDB:
             wandb.log({
                 "epoch": epoch+1, "lr": current_lr, "train_loss": loss,
-                "val_rmse": val_rmse, "val_r2": val_r2, "val_pcc": val_pcc, "val_scc": val_scc
+                "val_rmse": val_rmse, "val_r2": val_r2, "val_pcc": val_pcc
             })
 
+        # --- CHECKPOINTING & EARLY STOPPING RESTORED ---
         state_dict = {
             'epoch': epoch,
             'config': CONFIG,
