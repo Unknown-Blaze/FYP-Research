@@ -51,7 +51,9 @@ CONFIG = {
     'num_heads': 16,                
     'dropout': 0.3,               
     'weight_decay': 1e-4,         
-    'seed': 42,
+    'seed': 42,          # Matches your sequence config
+    'test_size': 0.1,    # Matches your sequence config (was 0.15)
+    'valid_size': 0.1,   # Matches your sequence config
     'grad_clip_norm': 1.0,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
@@ -355,11 +357,38 @@ def main():
 
     logger.info("Initializing Data...")
     df = pd.read_csv(CONFIG['dataset_path'])
-    label_col = 'binding_affinity_nM' if 'binding_affinity_nM' in df.columns else 'IC50'
-    df = df.dropna(subset=[label_col])
     
-    train_df, test_df = train_test_split(df, test_size=0.15, random_state=CONFIG['seed'])
+    # 1. Define Column Names (Must match CSV and sequence model)
+    label_col = 'binding_affinity_nM' if 'binding_affinity_nM' in df.columns else 'IC50'
+    mhc_col = 'mhc_sequence'  # Ensure this matches CSV header
+    pep_col = 'peptide'       # Ensure this matches CSV header
+    
+    # 2. Drop NA (Matches Sequence Model)
+    initial_count = len(df)
+    df = df.dropna(subset=[label_col, mhc_col, pep_col])
+    
+    # 3. CRITICAL: Filter Non-Alphabet Characters (MATCHES SEQUENCE MODEL)
+    # Your ESM script does this. If you don't do it here, the rows won't align.
+    df = df[df[pep_col].astype(str).str.isalpha()]
+    df = df[df[mhc_col].astype(str).str.isalpha()]
+    clean_count = len(df)
+    
+    logger.info(f"Loaded {initial_count} data points, {clean_count} remaining after cleaning.")
+    
+    # MATCH SEQUENCE MODEL: First split test, then split validation from train_val
+    train_val_df, test_df = train_test_split(
+        df, test_size=CONFIG['test_size'], random_state=CONFIG['seed']
+    )
+    
+    valid_size_scaled = CONFIG['valid_size'] / (1.0 - CONFIG['test_size'])
+    train_df, valid_df = train_test_split(
+        train_val_df, test_size=valid_size_scaled, random_state=CONFIG['seed']
+    )
+    
+    logger.info(f"  Training: {len(train_df)}, Validation: {len(valid_df)}, Test: {len(test_df)}")
+    
     train_ds = EnsembleDataset(train_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
+    valid_ds = EnsembleDataset(valid_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     test_ds = EnsembleDataset(test_df, CONFIG['graphs_dir_mhc'], CONFIG['graphs_dir_peptide'], label_col)
     
     train_loader = DataLoader(
@@ -367,9 +396,14 @@ def main():
         num_workers=4, pin_memory=True, persistent_workers=True,
         worker_init_fn=seed_worker, generator=g_seed 
     )
+    valid_loader = DataLoader(
+        valid_ds, batch_size=CONFIG['batch_size'], shuffle=False,
+        num_workers=4, pin_memory=True, persistent_workers=True,
+        worker_init_fn=seed_worker, generator=g_seed
+    )
     test_loader = DataLoader(
-        test_ds, batch_size=CONFIG['batch_size'], num_workers=4, 
-        pin_memory=True, persistent_workers=True,
+        test_ds, batch_size=CONFIG['batch_size'], shuffle=False,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         worker_init_fn=seed_worker, generator=g_seed
     )
     
@@ -438,7 +472,7 @@ def main():
         torch.cuda.empty_cache()
         
         loss = train_epoch_amp(model, train_loader, optimizer, criterion, device, scaler, CONFIG['grad_clip_norm'])
-        val_rmse, val_r2, val_pcc, val_scc = evaluate(model, test_loader, device)
+        val_rmse, val_r2, val_pcc, val_scc = evaluate(model, valid_loader, device)
         
         # Scheduler Steps
         if epoch < CONFIG['warmup_epochs']:
@@ -482,6 +516,30 @@ def main():
         if early_stop_counter >= patience:
             logger.info("🛑 Early Stopping Triggered.")
             break
+    
+    # --- FINAL TEST EVALUATION (matching sequence model pattern) ---
+    logger.info("\n" + "="*70)
+    logger.info("Loading best model for final test evaluation...")
+    checkpoint = torch.load(checkpoint_best)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    test_rmse, test_r2, test_pcc, test_scc = evaluate(model, test_loader, device)
+    
+    logger.info(f"FINAL TEST RESULTS:")
+    logger.info(f"  Test RMSE: {test_rmse:.4f}")
+    logger.info(f"  Test R²: {test_r2:.4f}")
+    logger.info(f"  Test PCC: {test_pcc:.4f}")
+    logger.info(f"  Test SCC: {test_scc:.4f}")
+    logger.info("="*70)
+    
+    if USE_WANDB:
+        wandb.log({
+            "final_test_rmse": test_rmse,
+            "final_test_r2": test_r2,
+            "final_test_pcc": test_pcc,
+            "final_test_scc": test_scc
+        })
+        wandb.finish()
 
 if __name__ == '__main__':
     main()

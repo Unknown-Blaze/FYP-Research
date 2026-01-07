@@ -1,0 +1,88 @@
+2026-01-07 03:38:35 | INFO | Initializing Data...
+2026-01-07 03:38:37 | INFO | 🔄 Found checkpoint: checkpoints/gnn_physics_last.pth. Resuming...
+2026-01-07 03:38:38 | INFO | ⏩ Resumed at Epoch 94 (Best RMSE: 0.9496)
+2026-01-07 04:07:34 | INFO | Ep 095 | LR 3.00e-04 | Train Loss 0.3231 | Val RMSE 0.9479 | Val R2 0.5558 | Val PCC 0.7575
+2026-01-07 04:07:35 | INFO | ⭐ New Best Model Saved
+2026-01-07 04:35:56 | INFO | Ep 096 | LR 3.00e-04 | Train Loss 0.3229 | Val RMSE 0.9754 | Val R2 0.5298 | Val PCC 0.7543
+2026-01-07 04:35:56 | INFO | ⏳ Patience: 1/20
+2026-01-07 05:03:46 | INFO | Ep 097 | LR 3.00e-04 | Train Loss 0.3210 | Val RMSE 0.9486 | Val R2 0.5552 | Val PCC 0.7595
+2026-01-07 05:03:46 | INFO | ⏳ Patience: 2/20
+2026-01-07 05:31:37 | INFO | Ep 098 | LR 3.00e-04 | Train Loss 0.3175 | Val RMSE 0.9569 | Val R2 0.5474 | Val PCC 0.7578
+2026-01-07 05:31:37 | INFO | ⏳ Patience: 3/20
+2026-01-07 05:59:19 | INFO | Ep 099 | LR 3.00e-04 | Train Loss 0.3175 | Val RMSE 0.9574 | Val R2 0.5469 | Val PCC 0.7560
+2026-01-07 05:59:19 | INFO | ⏳ Patience: 4/20
+2026-01-07 06:24:46 | INFO | Ep 100 | LR 3.00e-04 | Train Loss 0.3148 | Val RMSE 1.0070 | Val R2 0.4987 | Val PCC 0.7548
+2026-01-07 06:24:46 | INFO | ⏳ Patience: 5/20
+2026-01-07 06:49:57 | INFO | Ep 101 | LR 3.00e-04 | Train Loss 0.3142 | Val RMSE 0.9852 | Val R2 0.5203 | Val PCC 0.7542
+2026-01-07 06:49:57 | INFO | ⏳ Patience: 6/20
+2026-01-07 07:12:58 | INFO | Ep 102 | LR 1.50e-04 | Train Loss 0.2991 | Val RMSE 0.9526 | Val R2 0.5514 | Val PCC 0.7612
+2026-01-07 07:12:58 | INFO | ⏳ Patience: 7/20
+2026-01-07 07:35:24 | INFO | Ep 103 | LR 1.50e-04 | Train Loss 0.2972 | Val RMSE 0.9533 | Val R2 0.5508 | Val PCC 0.7623
+2026-01-07 07:35:24 | INFO | ⏳ Patience: 8/20
+2026-01-07 07:57:59 | INFO | Ep 104 | LR 1.50e-04 | Train Loss 0.2943 | Val RMSE 0.9409 | Val R2 0.5624 | Val PCC 0.7640
+2026-01-07 07:57:59 | INFO | ⭐ New Best Model Saved
+2026-01-07 08:20:39 | INFO | Ep 105 | LR 1.50e-04 | Train Loss 0.2938 | Val RMSE 0.9630 | Val R2 0.5416 | Val PCC 0.7701
+2026-01-07 08:20:39 | INFO | ⏳ Patience: 1/20
+2026-01-07 08:43:19 | INFO | Ep 106 | LR 1.50e-04 | Train Loss 0.2927 | Val RMSE 0.9430 | Val R2 0.5605 | Val PCC 0.7663
+2026-01-07 08:43:19 | INFO | ⏳ Patience: 2/20
+2026-01-07 09:09:14 | INFO | Ep 107 | LR 1.50e-04 | Train Loss 0.2923 | Val RMSE 0.9668 | Val R2 0.5380 | Val PCC 0.7608
+2026-01-07 09:09:14 | INFO | ⏳ Patience: 3/20
+2026-01-07 09:36:52 | INFO | Ep 108 | LR 1.50e-04 | Train Loss 0.2898 | Val RMSE 0.9526 | Val R2 0.5514 | Val PCC 0.7677
+2026-01-07 09:36:52 | INFO | ⏳ Patience: 4/20
+2026-01-07 10:04:59 | INFO | Ep 109 | LR 1.50e-04 | Train Loss 0.2882 | Val RMSE 0.9630 | Val R2 0.5416 | Val PCC 0.7656
+2026-01-07 10:04:59 | INFO | ⏳ Patience: 5/20
+2026-01-07 10:33:12 | INFO | Ep 110 | LR 1.50e-04 | Train Loss 0.2855 | Val RMSE 0.9591 | Val R2 0.5453 | Val PCC 0.7659
+2026-01-07 10:33:12 | INFO | ⏳ Patience: 6/20
+2026-01-07 11:01:04 | INFO | Ep 111 | LR 7.50e-05 | Train Loss 0.2823 | Val RMSE 0.9578 | Val R2 0.5466 | Val PCC 0.7685
+2026-01-07 11:01:04 | INFO | ⏳ Patience: 7/20
+2026-01-07 11:29:11 | INFO | Ep 112 | LR 7.50e-05 | Train Loss 0.2810 | Val RMSE 0.9434 | Val R2 0.5601 | Val PCC 0.7693
+2026-01-07 11:29:11 | INFO | ⏳ Patience: 8/20
+2026-01-07 11:56:47 | INFO | Ep 113 | LR 7.50e-05 | Train Loss 0.2788 | Val RMSE 0.9594 | Val R2 0.5451 | Val PCC 0.7717
+2026-01-07 11:56:47 | INFO | ⏳ Patience: 9/20
+2026-01-07 12:22:03 | INFO | Ep 114 | LR 7.50e-05 | Train Loss 0.2792 | Val RMSE 0.9395 | Val R2 0.5637 | Val PCC 0.7702
+2026-01-07 12:22:03 | INFO | ⭐ New Best Model Saved
+2026-01-07 12:44:48 | INFO | Ep 115 | LR 7.50e-05 | Train Loss 0.2792 | Val RMSE 0.9392 | Val R2 0.5640 | Val PCC 0.7699
+2026-01-07 12:44:48 | INFO | ⭐ New Best Model Saved
+2026-01-07 13:07:58 | INFO | Ep 116 | LR 7.50e-05 | Train Loss 0.2779 | Val RMSE 0.9180 | Val R2 0.5835 | Val PCC 0.7713
+2026-01-07 13:07:58 | INFO | ⭐ New Best Model Saved
+2026-01-07 13:36:14 | INFO | Ep 117 | LR 7.50e-05 | Train Loss 0.2760 | Val RMSE 0.9329 | Val R2 0.5698 | Val PCC 0.7697
+2026-01-07 13:36:14 | INFO | ⏳ Patience: 1/20
+2026-01-07 14:03:43 | INFO | Ep 118 | LR 7.50e-05 | Train Loss 0.2762 | Val RMSE 0.9486 | Val R2 0.5552 | Val PCC 0.7670
+2026-01-07 14:03:43 | INFO | ⏳ Patience: 2/20
+2026-01-07 14:31:25 | INFO | Ep 119 | LR 7.50e-05 | Train Loss 0.2754 | Val RMSE 0.9400 | Val R2 0.5633 | Val PCC 0.7691
+2026-01-07 14:31:25 | INFO | ⏳ Patience: 3/20
+2026-01-07 14:59:02 | INFO | Ep 120 | LR 7.50e-05 | Train Loss 0.2737 | Val RMSE 0.9518 | Val R2 0.5522 | Val PCC 0.7677
+2026-01-07 14:59:02 | INFO | ⏳ Patience: 4/20
+2026-01-07 15:26:12 | INFO | Ep 121 | LR 7.50e-05 | Train Loss 0.2769 | Val RMSE 0.9289 | Val R2 0.5734 | Val PCC 0.7719
+2026-01-07 15:26:12 | INFO | ⏳ Patience: 5/20
+2026-01-07 15:52:30 | INFO | Ep 122 | LR 7.50e-05 | Train Loss 0.2833 | Val RMSE 0.9260 | Val R2 0.5761 | Val PCC 0.7716
+2026-01-07 15:52:30 | INFO | ⏳ Patience: 6/20
+2026-01-07 16:16:52 | INFO | Ep 123 | LR 3.75e-05 | Train Loss 0.2780 | Val RMSE 0.9449 | Val R2 0.5587 | Val PCC 0.7711
+2026-01-07 16:16:52 | INFO | ⏳ Patience: 7/20
+2026-01-07 16:38:30 | INFO | Ep 124 | LR 3.75e-05 | Train Loss 0.2770 | Val RMSE 0.9340 | Val R2 0.5688 | Val PCC 0.7715
+2026-01-07 16:38:30 | INFO | ⏳ Patience: 8/20
+2026-01-07 17:00:06 | INFO | Ep 125 | LR 3.75e-05 | Train Loss 0.2764 | Val RMSE 0.9347 | Val R2 0.5681 | Val PCC 0.7715
+2026-01-07 17:00:06 | INFO | ⏳ Patience: 9/20
+2026-01-07 17:21:47 | INFO | Ep 126 | LR 3.75e-05 | Train Loss 0.2768 | Val RMSE 0.9257 | Val R2 0.5764 | Val PCC 0.7725
+2026-01-07 17:21:47 | INFO | ⏳ Patience: 10/20
+2026-01-07 17:43:20 | INFO | Ep 127 | LR 3.75e-05 | Train Loss 0.2747 | Val RMSE 0.9361 | Val R2 0.5668 | Val PCC 0.7727
+2026-01-07 17:43:20 | INFO | ⏳ Patience: 11/20
+2026-01-07 18:08:29 | INFO | Ep 128 | LR 3.75e-05 | Train Loss 0.2764 | Val RMSE 0.9243 | Val R2 0.5777 | Val PCC 0.7745
+2026-01-07 18:08:29 | INFO | ⏳ Patience: 12/20
+2026-01-07 18:35:53 | INFO | Ep 129 | LR 1.87e-05 | Train Loss 0.2715 | Val RMSE 0.9447 | Val R2 0.5589 | Val PCC 0.7714
+2026-01-07 18:35:53 | INFO | ⏳ Patience: 13/20
+2026-01-07 19:03:17 | INFO | Ep 130 | LR 1.87e-05 | Train Loss 0.2731 | Val RMSE 0.9418 | Val R2 0.5616 | Val PCC 0.7719
+2026-01-07 19:03:17 | INFO | ⏳ Patience: 14/20
+2026-01-07 19:30:48 | INFO | Ep 131 | LR 1.87e-05 | Train Loss 0.2725 | Val RMSE 0.9385 | Val R2 0.5646 | Val PCC 0.7712
+2026-01-07 19:30:48 | INFO | ⏳ Patience: 15/20
+2026-01-07 19:58:27 | INFO | Ep 132 | LR 1.87e-05 | Train Loss 0.2713 | Val RMSE 0.9443 | Val R2 0.5592 | Val PCC 0.7719
+2026-01-07 19:58:27 | INFO | ⏳ Patience: 16/20
+2026-01-07 20:25:53 | INFO | Ep 133 | LR 1.87e-05 | Train Loss 0.2697 | Val RMSE 0.9410 | Val R2 0.5623 | Val PCC 0.7734
+2026-01-07 20:25:53 | INFO | ⏳ Patience: 17/20
+2026-01-07 20:52:07 | INFO | Ep 134 | LR 1.87e-05 | Train Loss 0.2718 | Val RMSE 0.9342 | Val R2 0.5686 | Val PCC 0.7728
+2026-01-07 20:52:07 | INFO | ⏳ Patience: 18/20
+2026-01-07 21:16:38 | INFO | Ep 135 | LR 9.37e-06 | Train Loss 0.2703 | Val RMSE 0.9353 | Val R2 0.5676 | Val PCC 0.7732
+2026-01-07 21:16:38 | INFO | ⏳ Patience: 19/20
+2026-01-07 21:38:35 | INFO | Ep 136 | LR 9.37e-06 | Train Loss 0.2710 | Val RMSE 0.9342 | Val R2 0.5686 | Val PCC 0.7732
+2026-01-07 21:38:35 | INFO | ⏳ Patience: 20/20
+2026-01-07 21:38:35 | INFO | 🛑 Early Stopping Triggered.
