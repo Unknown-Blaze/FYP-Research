@@ -1,47 +1,22 @@
 ============================================================
-ENSEMBLE TRAINING REPORT - 2026-01-07 19:22:22.973230
+STRICT ENSEMBLE TRAINING (NO LEAKAGE) - 2026-01-12 16:23:53.383827
 ============================================================
 
-[1] LOADING DATA...
-   Original Samples: 78115
-   Cleaned Samples:  78115 (Dropped 0 NaNs)
-
-[2] DATA SPLIT
-   Training Set: 62492
-   Testing Set:  15623
+[1] DATA PARTITIONING (STRICT)
+   Base Model Train Set: 62491 (DISCARDED - Biased)
+   Ensemble Train Set:   7812   (Used to train Ensemble)
+   Ensemble Test Set:    7812  (Final Evaluation)
 
 ------------------------------
-TRAINING MODEL 1: LINEAR MIXER (Ridge)
-------------------------------
-📊 OPTIMIZED WEIGHTS:
-   ESM-2 Weight: 0.9469
-   GNN Weight:   0.0702
-   Bias/Intercept: -0.1069
-   ✅  NOTE: GNN is contributing significantly to the decision.
+TRAINING MODEL 1: LINEAR MIXER
+   ESM Weight: 0.7864
+   GNN Weight: 0.2023
 
 ------------------------------
-TRAINING MODEL 2: NEURAL MIXER (MLP)
-------------------------------
-   ✅ MLP Training Complete.
+TRAINING MODEL 2: NEURAL MIXER
 
 ============================================================
-🏆 FINAL PERFORMANCE REPORT (TEST SET)
+FINAL UNBIASED TEST RESULTS
 ============================================================
-MODEL                | RMSE     | R²       | PCC      | SCC     
------------------------------------------------------------------
-1. ESM Only          | 0.5811   | 0.8340   | 0.9134   | 0.9101
-2. GNN Only          | 0.7416   | 0.7296   | 0.8583   | 0.8593
-3. Linear Stack      | 0.5678   | 0.8415   | 0.9176   | 0.9144
-4. Neural Stack      | 0.5708   | 0.8398   | 0.9168   | 0.9135
------------------------------------------------------------------
-
-[4] SAVING MODELS...
-   ✅ Models saved to disk.
-
-[5] NEURAL NET FEATURE IMPORTANCE
-   esm_pred       : 1.3331
-   gnn_pred       : 0.1016
-   peptide_len    : 0.0010
-   plddt          : 0.0000
-   diff           : 0.1652
-   len_x_diff     : 0.1584
+Linear Stack | RMSE: 0.7368 | R2: 0.7337
+Neural Stack | RMSE: 0.7365 | R2: 0.7339
