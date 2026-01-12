@@ -246,6 +246,8 @@ ENCODING_METHOD_MAP = {
     'one_hot': one_hot_encode,
     'physical': physical_encode,
     'blosum': blosum_encode,
+    'Blosum62': blosum_encode,  # allow baseline config casing
+    'BLOSUM62': blosum_encode,
     'blosum80': blosum80_encode,
     'EDSSMat62': EDSSMat62_encode,
     'N_blosum': N_blosum_encode

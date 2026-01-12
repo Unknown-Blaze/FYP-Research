@@ -128,12 +128,12 @@ class AgreementRouting(nn.Module):
 
 
 class CNN_Peptide_Encoder(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, max_len_pep=15):
         super(CNN_Peptide_Encoder, self).__init__()
 
 
         self.conv_0 =nn.Conv1d(input_dim, 32, kernel_size=1,bias=False)
-        self.att_0 = Attention(32,15)
+        self.att_0 = Attention(32, max_len_pep)
 
         self.conv = torch.nn.Sequential()
         self.conv.add_module("conv_1", nn.Conv1d(32, 64, kernel_size=3))
@@ -401,7 +401,7 @@ class Model(nn.Module):
         # self.encoder_hla_a2 = CNN_HLA_Encoder_esm(1280, config.batch_size)
         # self.encoder_hla_a2 = CNN_HLA_Encoder_esmfold(366)
 
-        self.encoder_peptide2 = CNN_Peptide_Encoder(23)
+        self.encoder_peptide2 = CNN_Peptide_Encoder(23, max_len_pep=config.max_len_pep)
         
         self.context_extractor2 = Context_extractor(11)
         self.predictor = Predictor(self.context_extractor2.out_vector_dim, dropout)

@@ -1,0 +1,2 @@
+Date	IEDB reference	Allele	Peptide length	count	Measurement type	our_method_ic50_auc	our_method_ic50_srcc	NetMHCpan 2.8_auc	NetMHCpan 2.8_srcc	NetMHCpan 3.0_auc	NetMHCpan 3.0_srcc	NetMHCpan 4.0_auc	NetMHCpan 4.0_srcc	SMM_auc	SMM_srcc	ANN 3.4_auc	ANN 3.4_srcc	ANN 4.0_auc	ANN 4.0_srcc	ARB_auc	ARB_srcc	SMMPMBEC_auc	SMMPMBEC_srcc	IEDB Consensus_auc	IEDB Consensus_srcc	NetMHCcons_auc	NetMHCcons_srcc	PickPocket_auc	PickPocket_srcc
+-	-	-	-	-	-	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0

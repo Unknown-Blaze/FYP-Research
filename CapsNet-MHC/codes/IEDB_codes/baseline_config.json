@@ -1,0 +1,20 @@
+{
+    "working_dir": "./results_capsnet/",
+    "data_file": "./dataset/My_Baseline_Data/training_data.txt",
+    "test_file": "./dataset/My_Baseline_Data/training_data.txt",
+    "hla_seq_file": "./dataset/My_Baseline_Data/mhc_seqs.txt",
+    "mode": "train",
+    "encoding_method": "Blosum62",
+    "encoding_method2": "Blosum62",
+    "max_len_pep": 15,
+    "max_len_hla": 385,
+    "batch_size": 256,
+    "epochs": 120,
+    "dropout": 0.3,
+    "lr": 0.003,
+    "start_lr": 0.003,
+    "base_model_count": 2,
+    "model_count": 5,
+    "do_train": true,
+    "do_test": true
+}

@@ -1,6 +1,7 @@
 # Ignore model weights, outputs, and logs
 *.pt
 *.pth
+*.pkl
 *.log
 outputs/
 checkpoints*/

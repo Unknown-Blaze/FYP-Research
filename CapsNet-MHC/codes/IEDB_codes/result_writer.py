@@ -201,12 +201,21 @@ def get_weekly_result_info_dict(result_file):
                 continue
 
             info = line.strip('\n').split('\t')
+            # Defensive parsing: skip incomplete or placeholder rows
+            if len(info) < 7:
+                continue
+
             date = info[0]
             iedb_id = info[1]
             full_allele = info[2]
             measure_type = info[4]
             pep_len = len(info[5])
-            measure_value = float(info[6])
+
+            try:
+                measure_value = float(info[6])
+            except ValueError:
+                # Skip rows where the true label is missing ('-')
+                continue
 
             record_id = '{}-{}-{}-{}'.format(iedb_id, full_allele, pep_len, measure_type)
 

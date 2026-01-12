@@ -2,123 +2,146 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
-from sklearn.linear_model import LinearRegression
+from datetime import datetime
+from sklearn.linear_model import Ridge
 from sklearn.neural_network import MLPRegressor
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split # Still needed for logic
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_squared_error
 from scipy.stats import pearsonr, spearmanr
 
+# ==============================================================================
+# CONFIG 
+# ==============================================================================
+REPORT_FILE = "ensemble_results_report.txt"
+# MUST MATCH YOUR GNN/ESM CONFIG EXACTLY
+SEED = 42
+TEST_SIZE = 0.1
+VALID_SIZE = 0.1 
+
+def log_print(message, file_handle):
+    print(message)
+    file_handle.write(message + "\n")
+
 def train_ensemble():
-    # 1. Load Data
-    print("Loading ensemble data...")
-    if not os.path.exists("ensemble_meta_data.csv"):
-        print("❌ Error: 'ensemble_meta_data.csv' not found. Run inference first.")
-        return
+    with open(REPORT_FILE, "w") as f:
+        log_print("="*60, f)
+        log_print(f"STRICT ENSEMBLE TRAINING (NO LEAKAGE) - {datetime.now()}", f)
+        log_print("="*60, f)
 
-    df = pd.read_csv("ensemble_meta_data.csv")
-    
-    # 2. Filter Extreme Outliers
-    df = df.replace([np.inf, -np.inf], np.nan).dropna()
-    
-    features = ['esm_pred', 'gnn_pred', 'peptide_len', 'plddt', 'diff']
-    target = 'actual_pic50'
-    
-    X = df[features]
-    y = df[target]
+        # 1. Load Data
+        if not os.path.exists("ensemble_meta_data.csv"):
+            log_print("❌ Error: 'ensemble_meta_data.csv' not found.", f)
+            return
 
-    # 3. Split Data (80/20) - Keep raw X for Linear model interpretation
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    print(f"\nTraining on {len(X_train)} samples, Testing on {len(X_test)} samples.")
-
-    # --- STRATEGY 1: Linear Mixer (Uses RAW Predictions) ---
-    print("\nTraining Linear Mixer...")
-    linear_model = LinearRegression()
-    linear_model.fit(X_train[['esm_pred', 'gnn_pred']], y_train) 
-    
-    print("\n" + "="*40)
-    print("📊 LINEAR MIXER WEIGHTS")
-    print("="*40)
-    print(f"ESM Weight: {linear_model.coef_[0]:.4f}")
-    print(f"GNN Weight: {linear_model.coef_[1]:.4f}")
-    print(f"Bias:       {linear_model.intercept_:.4f}")
-    
-    # --- STRATEGY 2: Neural Mixer (Uses SCALED Features) ---
-    print("\nTraining Neural Mixer (MLP)...")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    
-    mlp_model = MLPRegressor(
-        hidden_layer_sizes=(128, 64, 32), 
-        activation='relu', 
-        solver='adam',
-        max_iter=1000, 
-        random_state=42,
-        learning_rate_init=0.001,
-        early_stopping=True
-    )
-    mlp_model.fit(X_train_scaled, y_train)
-
-    # --- EVALUATION FUNCTION ---
-    def evaluate(preds, name):
-        r2 = r2_score(y_test, preds)
-        rmse = np.sqrt(mean_squared_error(y_test, preds))
-        pcc, _ = pearsonr(y_test, preds)
-        scc, _ = spearmanr(y_test, preds)
+        df = pd.read_csv("ensemble_meta_data.csv")
         
-        print(f"[{name}]")
-        print(f"  RMSE: {rmse:.4f}")
-        print(f"  R2:   {r2:.4f}")
-        print(f"  PCC:  {pcc:.4f}")
-        print(f"  SCC:  {scc:.4f}")
-        print("-" * 30)
-        return preds
+        # 2. RECONSTRUCT THE SPLIT (CRITICAL STEP)
+        # We need to replicate the exact shuffling logic used in the base models
+        # so we know which rows correspond to Train, Val, and Test.
+        
+        # A. Clean NaNs (Must match the cleaning done in Inference/Base models)
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
+        
+        # B. Split 1: Isolate Test Set
+        # These are the rows your base models NEVER saw.
+        train_val_df, test_df = train_test_split(
+            df, test_size=TEST_SIZE, random_state=SEED
+        )
+        
+        # C. Split 2: Isolate Validation Set from Train
+        # These are the rows your base models used for Early Stopping, but NOT training weights.
+        valid_size_scaled = VALID_SIZE / (1.0 - TEST_SIZE)
+        train_df, val_df = train_test_split(
+            train_val_df, test_size=valid_size_scaled, random_state=SEED
+        )
+        
+        log_print(f"\n[1] DATA PARTITIONING (STRICT)", f)
+        log_print(f"   Base Model Train Set: {len(train_df)} (DISCARDED - Biased)", f)
+        log_print(f"   Ensemble Train Set:   {len(val_df)}   (Used to train Ensemble)", f)
+        log_print(f"   Ensemble Test Set:    {len(test_df)}  (Final Evaluation)", f)
 
-    print("\n" + "="*40)
-    print("🏆 FINAL RESULTS (Test Set)")
-    print("="*40)
-    
-    # 1. Base Models (Raw Data)
-    evaluate(X_test['esm_pred'], "1. ESM Only")
-    evaluate(X_test['gnn_pred'], "2. GNN Only")
+        # 3. ASSIGN DATASETS
+        # We TRAIN the ensemble on val_df (unseen by base model weights)
+        # We TEST the ensemble on test_df (unseen by everyone)
+        train_source = val_df 
+        test_source = test_df 
 
-    # 2. Linear Ensemble
-    lin_preds = linear_model.predict(X_test[['esm_pred', 'gnn_pred']])
-    evaluate(lin_preds, "3. Linear Stack")
+        # Feature Engineering
+        for data in [train_source, test_source]:
+            data['len_x_diff'] = data['peptide_len'] * data['diff']
 
-    # 3. Neural Ensemble (Using Scaled Data)
-    mlp_preds = mlp_model.predict(X_test_scaled)
-    evaluate(mlp_preds, "4. Neural Stack (MLP)")
+        features_mlp = ['esm_pred', 'gnn_pred', 'peptide_len', 'plddt', 'diff', 'len_x_diff']
+        features_linear = ['esm_pred', 'gnn_pred']
+        target = 'actual_pic50'
 
-    # Save Everything
-    joblib.dump(linear_model, "linear_meta_learner.pkl")
-    joblib.dump(mlp_model, "best_meta_learner_mlp.pkl")
-    joblib.dump(scaler, "meta_learner_scaler.pkl") 
-    print("\n✅ Saved Linear, MLP models, and Scaler.")
-    
-    # --- BONUS: Feature Importance for Neural Net ---
-    from sklearn.inspection import permutation_importance
-    
-    print("\n" + "="*40)
-    print("🧠 NEURAL NET FEATURE IMPORTANCE")
-    print("="*40)
-    
-    # Calculate importance on Test Set
-    perm_importance = permutation_importance(mlp_model, X_test_scaled, y_test, n_repeats=10, random_state=42)
-    
-    # Map back to feature names
-    for i, feature in enumerate(features):
-        print(f"{feature:15s}: {perm_importance.importances_mean[i]:.4f}")
-    
-    # Save Predictions for Plotting
-    results_df = X_test.copy()
-    results_df['actual'] = y_test
-    results_df['pred_linear'] = lin_preds
-    results_df['pred_mlp'] = mlp_preds
-    results_df.to_csv("final_ensemble_test_results.csv", index=False)
-    print("✅ Detailed test results saved to 'final_ensemble_test_results.csv'")
+        X_train = train_source
+        y_train = train_source[target]
+        X_test = test_source
+        y_test = test_source[target]
+
+        # ==============================================================================
+        # STRATEGY 1: LINEAR MIXER
+        # ==============================================================================
+        log_print("\n" + "-"*30, f)
+        log_print("TRAINING MODEL 1: LINEAR MIXER", f)
+        
+        linear_model = Ridge(alpha=1.0)
+        linear_model.fit(X_train[features_linear], y_train)
+        
+        log_print(f"   ESM Weight: {linear_model.coef_[0]:.4f}", f)
+        log_print(f"   GNN Weight: {linear_model.coef_[1]:.4f}", f)
+
+        # ==============================================================================
+        # STRATEGY 2: NEURAL MIXER
+        # ==============================================================================
+        log_print("\n" + "-"*30, f)
+        log_print("TRAINING MODEL 2: NEURAL MIXER", f)
+        
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train[features_mlp])
+        X_test_scaled = scaler.transform(X_test[features_mlp])
+        
+        # Note: Since validation sets are small, we reduce complexity to prevent overfitting
+        mlp_model = MLPRegressor(
+            hidden_layer_sizes=(64, 32), # Smaller architecture for smaller data
+            activation='relu',
+            solver='adam',
+            max_iter=2000,
+            learning_rate_init=0.001,
+            early_stopping=True,
+            validation_fraction=0.1
+        )
+        mlp_model.fit(X_train_scaled, y_train)
+
+        # ==============================================================================
+        # EVALUATION (ON TEST SET)
+        # ==============================================================================
+        def get_metrics(preds, y_true):
+            rmse = np.sqrt(mean_squared_error(y_true, preds))
+            r2 = r2_score(y_true, preds)
+            return rmse, r2
+
+        log_print("\n" + "="*60, f)
+        log_print("FINAL UNBIASED TEST RESULTS", f)
+        log_print("="*60, f)
+        
+        # 1. Linear Stack
+        lin_preds = linear_model.predict(X_test[features_linear])
+        l_rmse, l_r2 = get_metrics(lin_preds, y_test)
+        log_print(f"Linear Stack | RMSE: {l_rmse:.4f} | R2: {l_r2:.4f}", f)
+
+        # 2. Neural Stack
+        mlp_preds = mlp_model.predict(X_test_scaled)
+        m_rmse, m_r2 = get_metrics(mlp_preds, y_test)
+        log_print(f"Neural Stack | RMSE: {m_rmse:.4f} | R2: {m_r2:.4f}", f)
+        
+        # Save Models
+        joblib.dump(linear_model, "linear_meta_learner.pkl")
+        joblib.dump(mlp_model, "neural_meta_learner.pkl")
+        joblib.dump(scaler, "meta_learner_scaler.pkl")
+
+    print(f"\n✅ Done! Report saved to {REPORT_FILE}")
 
 if __name__ == "__main__":
     train_ensemble()

@@ -13,7 +13,7 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
 class DataProvider:
     def __init__(self, sequence_encode_func, sequence_encode_func2, data_file, test_file, batch_size, max_len_hla=273, max_len_pep=37,
-      model_count=5, shuffle=True):
+        model_count=5, shuffle=True, hla_seq_file=None):
         self.batch_size = batch_size
         self.data_file = data_file
 
@@ -24,6 +24,7 @@ class DataProvider:
         self.max_len_hla = max_len_hla
         self.max_len_pep = max_len_pep
         self.model_count=model_count
+        self.hla_seq_file = hla_seq_file or os.path.join(BASE_DIR, '../..','dataset/IEDB_dataset',  'mhc_i_protein_seq2.txt')
 
         self.batch_index_train = 0
         self.batch_index_val = 0
@@ -58,7 +59,7 @@ class DataProvider:
 
     def read_hla_sequences(self):
 
-        file_path = os.path.join(BASE_DIR, '../..','dataset/IEDB_dataset',  'mhc_i_protein_seq2.txt')
+        file_path = self.hla_seq_file
         with open(file_path, 'r') as in_file:
             for line_num, line in enumerate(in_file):
                 if line_num == 0:

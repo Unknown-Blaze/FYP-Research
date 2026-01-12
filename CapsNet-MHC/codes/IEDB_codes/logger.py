@@ -1,7 +1,9 @@
 import logging
+import os
 
 
 def setup_logging(output_folder, out_file='log.txt'):
+    os.makedirs(output_folder, exist_ok=True)
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - [%(name)s]: %(message)s',

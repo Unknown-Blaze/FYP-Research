@@ -9,7 +9,7 @@
 
 # 1. CONFIGURATION
 # ----------------
-REQUIRED_FREE_MIB=8000
+REQUIRED_FREE_MIB=14000
 CHECK_INTERVAL=10
 
 # Define your two steps here

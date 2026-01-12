@@ -10,130 +10,49 @@ import yaml
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Batch
-from torch_geometric.nn import GATv2Conv, GlobalAttention
 
 # ============================================================================
-# 1. MODEL DEFINITIONS
-# ============================================================================
-
-class MultiHeadAttentionFusion(nn.Module):
-    def __init__(self, hidden_dim, num_heads=4, dropout=0.1):
-        super().__init__()
-        self.query_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, template_embeddings):
-        batch_size = template_embeddings.size(0)
-        query = self.query_token.expand(batch_size, -1, -1)
-        attn_output, _ = self.attn(query, template_embeddings, template_embeddings)
-        return self.norm(attn_output + query).squeeze(1)
-
-class EnsembleGraphNetwork(nn.Module):
-    def __init__(self, input_dim=6, hidden_dims=[256, 256, 256], num_heads=8, dropout=0.0):
-        super().__init__()
-        self.dropout = dropout
-        
-        # --- 1. GNN Backbone ---
-        dims = [input_dim] + hidden_dims
-        self.gat_layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        
-        for i in range(len(dims) - 1):
-            self.gat_layers.append(
-                GATv2Conv(dims[i], dims[i+1]//num_heads, heads=num_heads, 
-                          dropout=dropout, edge_dim=16, concat=True)
-            )
-            self.norms.append(nn.LayerNorm(dims[i+1]))
-            
-        self.graph_dim = dims[-1]
-
-        # --- 2. Pooling ---
-        self.pool_gate = nn.Sequential(
-            nn.Linear(self.graph_dim, 1),
-            nn.Sigmoid()
-        )
-        self.global_pool = GlobalAttention(gate_nn=self.pool_gate)
-
-        # --- SIMILARITY INJECTION ---
-        self.sim_proj = nn.Sequential(
-            nn.Linear(self.graph_dim + 1, self.graph_dim),
-            nn.LayerNorm(self.graph_dim),
-            nn.ReLU()
-        )
-
-        # --- 3. Template Fusion ---
-        self.fusion_module = MultiHeadAttentionFusion(self.graph_dim, num_heads=num_heads)
-
-        # --- 4. Prediction Head ---
-        self.fc_layers = nn.Sequential(
-            nn.Linear(self.graph_dim, 128),
-            nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, data):
-        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
-        sim_scores = data.sim_score 
-
-        for gat, norm in zip(self.gat_layers, self.norms):
-            x_in = x
-            x = gat(x, edge_index, edge_attr=edge_attr)
-            if x.shape[1] == x_in.shape[1]: x = x + x_in
-            x = norm(x)
-            x = F.elu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-
-        graph_embed = self.global_pool(x, batch)
-        
-        if sim_scores.dim() == 1:
-            sim_scores = sim_scores.view(-1, 1)
-        
-        combined = torch.cat([graph_embed, sim_scores], dim=1) 
-        graph_embed = self.sim_proj(combined)
-
-        actual_batch_size = graph_embed.shape[0] // 4
-        templates_view = graph_embed.view(actual_batch_size, 4, -1)
-        fused_vec = self.fusion_module(templates_view)
-        
-        return self.fc_layers(fused_vec).squeeze()
-
-# ============================================================================
-# 2. CONFIGURATION
+# 1. CONFIGURATION
 # ============================================================================
 CONFIG = {
     'data_path': './iedb_dataset.csv', 
     'output_csv': 'ensemble_meta_data.csv',
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'batch_size': 16, # Safe size for inference
+    'batch_size': 16,
     
+    # --- ESM PATHS ---
     'esm_ckpt': 'checkpoints/checkpoints_esm2_warmstart/best_model.pt',
     'esm_config': 'sequence/config.yaml',
     'esm_scaler': 'checkpoints/checkpoints_esm2_warmstart/label_scaler.joblib',
     
-    'gnn_ckpt': 'structure/checkpoints/gnn_a100_best.pth',
+    # --- GNN PATHS (UPDATED) ---
+    'gnn_ckpt': 'structure/checkpoints/gnn_physics_best.pth', # <--- FIXED PATH
     'gnn_mhc': 'structure/data/graphs/ensemble/mhc',
     'gnn_pep': 'structure/data/graphs/ensemble/peptide'
 }
 
 # ============================================================================
-# 3. SETUP & IMPORTS
+# 2. SETUP & IMPORTS
 # ============================================================================
 sys.path.append(os.path.join(os.getcwd(), 'sequence'))
+sys.path.append(os.path.join(os.getcwd(), 'structure')) # Add structure folder to path
 
 try:
     from train_finetune import ESM2FineTuneModel, AppConfig
-    # Import Dataset from your training script
-    from structure.train_gnn_model import EnsembleDataset
+    
+    # IMPORT GNN MODEL & DATASET FROM YOUR TRAINING SCRIPT
+    # This ensures dimensions match exactly what you trained with
+    from train_gnn_model import EnsembleGraphNetwork, EnsembleDataset, CONFIG as GNN_TRAIN_CONFIG
+    
 except ImportError as e:
     print(f"❌ IMPORTS FAILED: {e}")
+    print("Ensure you are running this from the project root and paths are correct.")
     sys.exit(1)
 
 def load_models(device):
     print("⏳ Loading Models...")
     
+    # --- LOAD ESM ---
     with open(CONFIG['esm_config']) as f: esm_yaml = yaml.safe_load(f)
     esm_yaml['data_file'] = __file__ 
     esm_cfg = AppConfig(**esm_yaml)
@@ -154,17 +73,21 @@ def load_models(device):
         print("⚠️ ESM Scaler NOT found. Using raw output.")
         scaler = None
 
+    # --- LOAD GNN ---
     print(f"⏳ Loading GNN from {CONFIG['gnn_ckpt']}...")
-    ckpt = torch.load(CONFIG['gnn_ckpt'], map_location=device)
-    saved_conf = ckpt.get('config', None)
     
+    # Initialize with dimensions from the Training Config to be safe
+    # But hardcoding here to be explicit about what we expect
     gnn_model = EnsembleGraphNetwork(
-        input_dim=6, 
+        input_dim=30,   # <--- FIXED (Physics Dims)
+        edge_dim=18,    # <--- FIXED (Physics Dims)
         hidden_dims=[512, 512, 512],
         num_heads=16,
         dropout=0.0
     ).to(device)
 
+    # Load Weights
+    ckpt = torch.load(CONFIG['gnn_ckpt'], map_location=device)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
     gnn_model.load_state_dict(state)
     gnn_model.eval()
@@ -172,16 +95,19 @@ def load_models(device):
     return esm_model, gnn_model, tokenizer, scaler
 
 # ============================================================================
-# 4. INFERENCE DATASET & COLLATE (OPTIMIZED)
+# 3. INFERENCE DATASET & COLLATE
 # ============================================================================
 class InferenceDataset(Dataset):
-    def __init__(self, df, gnn_ds, tokenizer):
+    def __init__(self, df, gnn_ds):
         self.df = df
         self.gnn_ds = gnn_ds
-        self.tokenizer = tokenizer
+    
     def __len__(self): return len(self.df)
+    
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        
+        # Get Graph (Uses the Self-Healing logic from train_gnn_model.py)
         graph_batch, target = self.gnn_ds[idx]
         
         mhc_seq = row['mhc_sequence'] 
@@ -194,7 +120,6 @@ class InferenceDataset(Dataset):
 def collate_wrapper(batch, tokenizer):
     mhc_seqs, pep_seqs, graph_batches, targets, lens, plddts = zip(*batch)
     
-    # --- SMART PADDING (SAVES MEMORY) ---
     mhc_tok = tokenizer(list(mhc_seqs), return_tensors='pt', padding=True, truncation=True, max_length=512)
     pep_tok = tokenizer(list(pep_seqs), return_tensors='pt', padding=True, truncation=True, max_length=512)
     
@@ -203,7 +128,7 @@ def collate_wrapper(batch, tokenizer):
     return mhc_tok, pep_tok, unified_batch_graph, torch.tensor(targets), lens, plddts
 
 # ============================================================================
-# 5. MAIN EXECUTION (FIXED)
+# 4. MAIN EXECUTION
 # ============================================================================
 def main():
     device = torch.device(CONFIG['device'])
@@ -212,9 +137,10 @@ def main():
     print("⏳ Reading CSV...")
     df = pd.read_csv(CONFIG['data_path']).dropna(subset=['mhc_sequence', 'peptide'])
     
+    # Initialize the Robust Dataset from Structure Module
     gnn_ds = EnsembleDataset(df, CONFIG['gnn_mhc'], CONFIG['gnn_pep'], label_col='binding_affinity_nM')
     
-    dataset = InferenceDataset(df, gnn_ds, tokenizer)
+    dataset = InferenceDataset(df, gnn_ds)
     loader = DataLoader(
         dataset, 
         batch_size=CONFIG['batch_size'], 
@@ -227,8 +153,6 @@ def main():
     results = []
     print(f"🚀 Running Inference on {len(df)} samples...")
     
-    # NOTE: DO NOT CALL .half() HERE. Autocast handles it.
-    
     for batch in tqdm(loader):
         try:
             mhc_tok, pep_tok, unified_graph, targets, lens, plddts = batch
@@ -238,12 +162,11 @@ def main():
             unified_graph = unified_graph.to(device)
             
             with torch.no_grad():
-                # --- AUTOCAST MAGIC (Fixes the dtype error) ---
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type='cuda'):
                     esm_raw = esm_model(esm_batch_mhc, esm_batch_pep)
                     gnn_pred = gnn_model(unified_graph)
                 
-                # --- PROCESSING (Back to Float32) ---
+                # ESM Post-Process
                 if scaler is not None:
                     esm_raw_cpu = esm_raw.float().cpu().numpy().reshape(-1, 1)
                     esm_pred_np = scaler.inverse_transform(esm_raw_cpu).reshape(-1)
@@ -270,7 +193,6 @@ def main():
                 
         except Exception as e:
             print(f"⚠️ Batch Error: {e}")
-            torch.cuda.empty_cache()
             continue
 
     pd.DataFrame(results).to_csv(CONFIG['output_csv'], index=False)

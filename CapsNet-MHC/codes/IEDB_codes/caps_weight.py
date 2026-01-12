@@ -29,7 +29,8 @@ def main():
         config.batch_size,
         max_len_hla=config.max_len_hla,
         max_len_pep=config.max_len_pep,
-        model_count=config.model_count
+        model_count=config.model_count,
+        hla_seq_file=config.hla_seq_file
         )
     device = config.device
     models = config.model_count*config.base_model_count
