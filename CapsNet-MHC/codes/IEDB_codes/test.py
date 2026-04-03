@@ -96,9 +96,20 @@ def test(config, data_provider):
 
     device = config.device
     
-    temp_list=[] 
-    ground_truth_dict = {}  # Store ground truth pIC50 values by uid
+    # Load ground truth from test file
+    ground_truth_dict = {}
+    log_to_file('Loading ground truth from', config.test_file)
+    with open(config.test_file, 'r') as f:
+        next(f)  # Skip header
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 6:
+                uid = parts[0]  # First column is UID
+                ic50_value = float(parts[5])  # Last column is IC50 (pIC50 in our case)
+                ground_truth_dict[uid] = ic50_value
+    log_to_file('Loaded ground truth samples', len(ground_truth_dict))
     
+    temp_list=[] 
     for p in range(config.base_model_count):
         for k in range(config.model_count):
             # load and prepare model
@@ -113,21 +124,10 @@ def test(config, data_provider):
                 data = data_provider.batch_test()
                 
                 with torch.no_grad():
-                    # Extract ground truth if first model (they're the same across models)
-                    if p == 0 and k == 0:
-                        # Unpack data tuple - format: (hla_a, hla_mask, hla_a2, hla_mask2, pep, pep_mask, pep2, pep_mask2, uid_list)
-                        # For test batches, we might need to check if ground truth is available
-                        # If test data includes IC50, it would be in position 8 or 9
-                        if len(data) > 9:  # If IC50 is included in test data
-                            ic50_values = data[8]
-                            uid_list = data[9]
-                            for i, uid in enumerate(uid_list):
-                                ground_truth_dict[uid] = ic50_values[i].item()
-                    
                     pred_ic50, uid_list= batch_test(model, device, data, config)
                     #print(pred_ic50)
                     for i, uid in enumerate(uid_list):
-                        temp_dict[uid] = pred_ic50[i].item()
+                        temp_dict[uid] = pred_ic50[i].item() * 12.0
             temp_list.append(temp_dict)
 
     # average score of the emsemble model
@@ -146,20 +146,27 @@ def test(config, data_provider):
     for j in result_dict.keys():
         result_dict[j]=result_dict[j]/(config.model_count*config.base_model_count)
 
-    #print(result_dict)
-    result_file = weeekly_result_writer(result_dict, config)
-    log_to_file('Testing result file', result_file)
-
-    # Calculate and log metrics if ground truth is available
+    # Debug: Check if predictions were collected
+    log_to_file('Total predictions collected', len(result_dict))
+    if len(result_dict) > 0:
+        sample_uids = list(result_dict.keys())[:5]
+        sample_preds = [result_dict[uid] for uid in sample_uids]
+        log_to_file('Sample UIDs in result_dict', sample_uids)
+        log_to_file('Sample predictions (raw pIC50)', sample_preds)
+        log_to_file('Prediction stats', f"min={min(result_dict.values()):.4f}, max={max(result_dict.values()):.4f}, mean={np.mean(list(result_dict.values())):.4f}")
+    
+    # Calculate metrics BEFORE any transformation (both are pIC50)
     if ground_truth_dict:
         y_true = []
         y_pred = []
         for uid in sorted(ground_truth_dict.keys()):
             if uid in result_dict:
                 y_true.append(ground_truth_dict[uid])
-                y_pred.append(result_dict[uid])
+                y_pred.append(result_dict[uid])  # Raw pIC50 prediction
         
         if len(y_true) > 0:
+            log_to_file('Ground truth stats', f"min={min(y_true):.4f}, max={max(y_true):.4f}, mean={np.mean(y_true):.4f}")
+            
             metrics = calculate_metrics(y_true, y_pred)
             log_to_file('R² Score', f"{metrics['r2']:.4f}")
             log_to_file('Pearson Correlation (PCC)', f"{metrics['pcc']:.4f} (p-value: {metrics['pcc_pval']:.2e})")
@@ -181,9 +188,15 @@ def test(config, data_provider):
             log_to_file('Detailed metrics file', metrics_file)
     else:
         log_to_file('Warning', 'No ground truth available for metrics calculation')
+    
+    # Write results file (will apply transformation for display)
+    #print(result_dict)
+    result_file = weeekly_result_writer(result_dict, config)
+    log_to_file('Testing result file', result_file)
 
-    metric_file = write_metrics_file(result_file, config)
-    log_to_file('Testing metric result file', metric_file)
+    # Skip legacy metric writer (incompatible with SOTA Strict format)
+    # metric_file = write_metrics_file(result_file, config)
+    # log_to_file('Testing metric result file', metric_file)
 
 
 #############################################################################################

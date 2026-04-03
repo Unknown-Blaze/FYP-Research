@@ -30,25 +30,13 @@ def weeekly_result_writer(result_dict, config):
                 )
                 out_file.write(out_str)
             else:
-                iedb_id = info[1]
-                alleles = info[2]
-                measure_type = info[4]
-                peptide = info[5]
-
-                hla_a = alleles
-
-                uid = '{iedb_id}-{hla_a}-{peptide}-{measure_type}'.format(
-                    iedb_id=iedb_id,
-                    hla_a=hla_a,
-                    # hla_b=hla_b,
-                    peptide=peptide,
-                    measure_type=measure_type,
-                )
+                # Use simple UID from first column (matches SOTA strict format)
+                uid = info[0]
 
                 if uid not in result_dict:
                     value = '-'
                 else:
-                    value = math.pow(50000,1-result_dict[uid])
+                    value = result_dict[uid] * 12.0
                 out_str = '{}\t{}\t{}\n'.format(
                     '\t'.join(info[:7]),
                     value,

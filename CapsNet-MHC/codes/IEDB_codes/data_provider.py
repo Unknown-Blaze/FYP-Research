@@ -74,31 +74,37 @@ class DataProvider:
 
 
     def read_weekly_data(self):
-
+        skipped_long_pep = 0
+        skipped_missing_mhc = 0
+        
         with open(self.test_file) as in_file:
             for line_num, line in enumerate(in_file):
                 if line_num == 0:
                     continue
 
                 info = line.strip('\n').split('\t')
-                iedb_id = info[1]
-                alleles = info[2]
-                measure_type = info[4]
-                peptide = info[5]
+                # SOTA Strict format: UID, Allele, Dummy, Peptide, Dummy, IC50
+                uid = info[0]
+                alleles = info[1]
+                peptide = info[3]
                 org_pep=peptide[:]
                 if len(peptide) > self.max_len_pep:
+                    skipped_long_pep += 1
                     continue
                 hla_a = alleles
                 if hla_a not in self.hla_sequence :
+                    skipped_missing_mhc += 1
+                    if skipped_missing_mhc <= 5:  # Show first 5
+                        print(f"DEBUG: Skipping {hla_a} - not in MHC sequences")
                     continue
-                uid = '{iedb_id}-{hla_a}-{peptide}-{measure_type}'.format(
-                    iedb_id=iedb_id,
-                    hla_a=hla_a,
-                    peptide=org_pep,
-                    measure_type=measure_type
-                )
+                # Use simple UID from first column (for SOTA strict format)
                 # print(uid)
                 self.weekly_samples.append((hla_a,peptide, uid))
+        
+        print(f"DEBUG: Loaded {len(self.weekly_samples)} test samples")
+        print(f"DEBUG: Skipped {skipped_long_pep} samples (peptide too long)")
+        print(f"DEBUG: Skipped {skipped_missing_mhc} samples (MHC not found)")
+        print(f"DEBUG: Total MHC sequences loaded: {len(self.hla_sequence)}")
             
     def read_training_data(self):
 
@@ -110,6 +116,7 @@ class DataProvider:
                 info = line.strip('\n').split('\t')
                 # print(info)
 
+                # SOTA Strict format: UID, Allele, Dummy, Peptide, Dummy, pIC50
                 hla_a = info[1]
 
                 if hla_a not in self.hla_sequence :
@@ -119,10 +126,18 @@ class DataProvider:
                 if len(peptide) > self.max_len_pep:
                     continue
 
-                ic50 = float(info[-1])
-                ic50=1-math.log(ic50,50000)
+                # NORMALIZATION: 
+                # Standard mapping: 1.0 = Strong Binder, 0.0 = Non-Binder
+                # pIC50 usually caps at ~12-14. Let's divide by a constant scale factor.
+                # Or use the standard NetMHC normalization: 1 - log(IC50)/log(50000)
+                # But since we already have pIC50, let's just scale it.
+                raw_pic50 = float(info[5])
+                # Scale 0-10 -> 0-1 (Assuming max pIC50 is roughly 10-12)
+                ic50 = raw_pic50 / 12.0  
+                # Clamp to 0-1 to be safe
+                ic50 = max(0.0, min(1.0, ic50))
 
-                self.samples.append((hla_a,peptide, ic50))
+                self.samples.append((hla_a, peptide, ic50))
 
         if self.shuffle:
             random.shuffle(self.samples)
