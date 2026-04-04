@@ -27,6 +27,14 @@ pip install -r requirements.txt
 
 If `python3.8` is not the exact interpreter on your machine, use the full path to your Python 3.8.10 binary when creating the venv.
 
+## Data Availability
+
+Large generated assets are not versioned in this repository.
+
+* The main dataset file used by the pipeline is [iedb_dataset.csv](iedb_dataset.csv).
+* Structure-derived artifacts (for example generated graphs and intermediate structure outputs under [structure/data](structure/data)) are stored on BioNet internal storage for lab use.
+* If you are an external reviewer and need those assets, please request access from the repository owner.
+
 ## End-to-End Run Order
 
 Run from repository root unless otherwise noted.
