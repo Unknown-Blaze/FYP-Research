@@ -1,2 +1,0 @@
-HLA	peptide	Label	Length
-HLA-A*02:01	APRNKIGTL	1	9

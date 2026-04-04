@@ -1,5 +1,0 @@
-Clear all models
-Add logs
-Figure out the process to integrate esm-3 and other PLMs and where
-Clean up all the code by putting it in folders
-Add configs file and some simple docs to remember the commands for training / testing / etc.

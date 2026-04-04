@@ -1,4 +1,0 @@
-25-08-22 20:20 - [Encoding method2]: blosum
-25-08-22 20:20 - [max_len_hla]: 34
-25-08-22 20:20 - [max_len_pep]: 15
-25-08-22 20:21 - [Testing result file]: /home3/rudrapra001/FYP-Research/CapsNet-MHC/codes/Anthem_codes/Anthem_test/weekly_result.txt

@@ -1,8 +1,0 @@
-Regression Metrics (pIC50)
-==================================================
-R² Score: -15.7107
-Pearson Correlation (PCC): 0.7714 (p-value: 0.00e+00)
-Spearman Correlation (SCC): 0.7718 (p-value: 0.00e+00)
-RMSE: 5.8369
-MAE: 5.6780
-Number of test samples: 7812

@@ -1,5 +1,0 @@
-26-01-07 22:01 - [Encoding method2]: Blosum62
-26-01-07 22:01 - [max_len_hla]: 385
-26-01-07 22:01 - [max_len_pep]: 15
-26-01-07 22:01 - [Testing result file]: /home3/rudrapra001/FYP-Research/CapsNet-MHC/codes/IEDB_codes/./results_capsnet/weekly_result.txt
-26-01-07 22:01 - [Testing metric result file]: /home3/rudrapra001/FYP-Research/CapsNet-MHC/codes/IEDB_codes/./results_capsnet/weekly_result_METRICS.txt
