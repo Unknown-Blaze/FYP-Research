@@ -14,7 +14,8 @@ while true; do
     
     # Run the python script
     # -u unbuffers output so you see it immediately in tmux
-    python -u train_gnn_model.py
+    PYTHON_BIN="${PYTHON_BIN:-python}"
+    "$PYTHON_BIN" -u train_gnn_model.py
     
     # Capture exit code
     EXIT_CODE=$?

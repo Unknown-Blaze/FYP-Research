@@ -15,23 +15,17 @@ This repository is organized for readers who want to reproduce a three-stage MHC
 
 ## Environment Setup
 
-Use one environment for sequence + ensemble and one optional structure-focused conda environment.
-
-### Option A: Pip environment (sequence + ensemble)
+Use one Python 3.8.10 virtual environment for the entire pipeline. Create it from the root so the same environment is used for sequence, structure, and ensemble steps.
 
 ```bash
-python -m venv .venv
+python3.8 -m venv .venv
 source .venv/bin/activate
+python --version
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Option B: Conda environment (structure pipeline)
-
-```bash
-conda env create -f structure/environment_esm_graph.yml
-conda activate esm_graph
-```
+If `python3.8` is not the exact interpreter on your machine, use the full path to your Python 3.8.10 binary when creating the venv.
 
 ## End-to-End Run Order
 
@@ -55,6 +49,8 @@ python train_gnn_model.py
 # bash train_gnn_model.sh
 cd ..
 ```
+
+The structure step runs in the same Python environment as the sequence step; it does not require a separate conda environment in the current repo layout.
 
 3. Ensemble/fusion
 
@@ -85,6 +81,7 @@ python training_visualizations/scripts/auc_calc.py
 * Primary sequence config: [sequence/config.yaml](sequence/config.yaml)
 * Integration reference config: [config_multimodal.yaml](config_multimodal.yaml)
 * Root entry scripts are path-safe and can be called from any working directory.
+* The shared environment is a root [venv](https://docs.python.org/3/library/venv.html) created from Python 3.8.10 and populated from [requirements.txt](requirements.txt).
 
 ## Generated Artifacts and Git Ignore Policy
 

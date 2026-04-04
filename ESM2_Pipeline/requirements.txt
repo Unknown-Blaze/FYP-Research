@@ -87,6 +87,7 @@ pyasn1==0.6.1
 pyasn1-modules==0.4.2
 pydantic==2.10.6
 pydantic-core==2.27.2
+--find-links https://data.pyg.org/whl/torch-2.4.1+cu121.html
 pyg-lib==0.4.0+pt24cu121
 pygments==2.19.2
 pyparsing==3.1.4
