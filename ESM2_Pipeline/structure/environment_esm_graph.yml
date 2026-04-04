@@ -24,11 +24,11 @@ dependencies:
   
   # Pip dependencies for PyG
   - pip:
+    - -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
     - torch-geometric
-    # We install the optimized scatter/sparse libs via pip with the specific wheel link
-    # to avoid compilation errors.
-    - pyg_lib -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
-    - torch_scatter -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
-    - torch_sparse -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
-    - torch_cluster -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
-    - torch_spline_conv -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
+    # Install optimized scatter/sparse wheels from the official PyG wheel index.
+    - pyg_lib
+    - torch_scatter
+    - torch_sparse
+    - torch_cluster
+    - torch_spline_conv

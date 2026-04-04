@@ -27,6 +27,7 @@ from torch.nn.utils.rnn import pad_sequence
 import warnings
 import os
 import sys
+from pathlib import Path
 import random
 import logging
 import joblib
@@ -736,6 +737,19 @@ def load_config(config_path: str) -> AppConfig:
     try:
         with open(config_path, 'r') as f:
             config_data: Dict[str, Any] = yaml.safe_load(f)
+
+        config_dir = Path(config_path).resolve().parent
+
+        # Make path values stable regardless caller working directory.
+        if 'data_file' in config_data:
+            data_file = Path(config_data['data_file'])
+            if not data_file.is_absolute():
+                config_data['data_file'] = str((config_dir / data_file).resolve())
+
+        if 'output_dir' in config_data:
+            output_dir = Path(config_data['output_dir'])
+            if not output_dir.is_absolute():
+                config_data['output_dir'] = str((config_dir / output_dir).resolve())
         
         config = AppConfig(**config_data)
         os.makedirs(config.output_dir, exist_ok=True)

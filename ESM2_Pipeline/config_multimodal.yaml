@@ -1,18 +1,22 @@
 # ==========================================
 # INTEGRATED SEQUENCE + STRUCTURE CONFIG
 # ==========================================
+# NOTE:
+# This file is a repository-level reference config aligned to the current
+# root/sequence/structure layout. It is not the primary runtime config for
+# existing scripts unless explicitly wired in.
 
 # --- Sequence Pipeline (Already Trained) ---
 sequence_config:
   model_name: "Synthyra/ESMplusplus_large"
   tokenizer_name: "facebook/esm2_t33_650M_UR50D"
-  pretrained_checkpoint: "./sequence_pipeline/checkpoints/checkpoints_esmc_warmstart/best_model.pt"
+  pretrained_checkpoint: "./sequence/checkpoints/checkpoints_esmc_warmstart/best_model.pt"
   freeze_sequence_encoder: true  # ← Don't retrain sequence encoder
 
 # --- Structure Pipeline (NEW) ---
 structure_config:
-  pdb_dir: "./structure/data/structures"
-  graph_cache_dir: "./structure/data/graphs"
+  pdb_dir: "./structure/templates"
+  graph_cache_dir: "./structure/data/graphs/ensemble"
   
   # Graph neural network config
   graph_model: "EGNN"  # Options: EGNN, GAT, GCN, GraphMamba
@@ -76,7 +80,7 @@ data_config:
 
 # --- Output ---
 output_config:
-  output_dir: "./multimodal_pipeline/checkpoints"
+  output_dir: "./sequence/checkpoints/checkpoints_esm2_advanced_CA"
   save_best_model: true
   save_predictions: true
   log_tensorboard: true

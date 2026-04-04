@@ -4,6 +4,7 @@ import joblib
 import os
 import sys
 import argparse
+from pathlib import Path
 from datetime import datetime
 from sklearn.linear_model import Ridge
 from sklearn.neural_network import MLPRegressor
@@ -19,6 +20,8 @@ REPORT_FILE = "ensemble_results_report.txt"
 SEED = 42
 TEST_SIZE = 0.1
 VALID_SIZE = 0.1 
+BASE_DIR = Path(__file__).resolve().parent
+REPORT_FILE = str(BASE_DIR / "ensemble_results_report.txt")
 
 def log_print(message, file_handle=None):
     print(message)
@@ -129,15 +132,15 @@ def run_one_seed(df, split_seed, meta_seed, save_artifacts=False, file_handle=No
     }
 
     if save_artifacts:
-        joblib.dump(linear_model, "linear_meta_learner.pkl")
-        joblib.dump(mlp_model, "neural_meta_learner.pkl")
-        joblib.dump(scaler, "meta_learner_scaler.pkl")
+        joblib.dump(linear_model, BASE_DIR / "linear_meta_learner.pkl")
+        joblib.dump(mlp_model, BASE_DIR / "neural_meta_learner.pkl")
+        joblib.dump(scaler, BASE_DIR / "meta_learner_scaler.pkl")
 
         results_df = X_test.copy()
         results_df['actual'] = y_test
         results_df['pred_linear'] = lin_preds
         results_df['pred_mlp'] = mlp_preds
-        results_df.to_csv("final_ensemble_test_results.csv", index=False)
+        results_df.to_csv(BASE_DIR / "final_ensemble_test_results.csv", index=False)
 
     return seed_metrics
 
@@ -145,12 +148,13 @@ def train_ensemble(meta_seeds, split_seed):
     f = open(REPORT_FILE, "w")
     log_print(f"ENSEMBLE TRAINING REPORT - {datetime.now()}\n", f)
 
-    if not os.path.exists("ensemble_meta_data.csv"):
+    meta_path = BASE_DIR / "ensemble_meta_data.csv"
+    if not meta_path.exists():
         log_print("❌ Error: 'ensemble_meta_data.csv' not found.", f)
         f.close()
         return
 
-    df = pd.read_csv("ensemble_meta_data.csv")
+    df = pd.read_csv(meta_path)
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
 
     all_seed_metrics = []
@@ -178,10 +182,10 @@ def train_ensemble(meta_seeds, split_seed):
             })
 
     per_seed_df = pd.DataFrame(per_seed_rows)
-    per_seed_df.to_csv("ensemble_seed_results.csv", index=False)
+    per_seed_df.to_csv(BASE_DIR / "ensemble_seed_results.csv", index=False)
 
     summary_df = summarize_metrics(all_seed_metrics)
-    summary_df.to_csv("ensemble_mean_sd_summary.csv", index=False)
+    summary_df.to_csv(BASE_DIR / "ensemble_mean_sd_summary.csv", index=False)
 
     print_section_header("MEAN ± SD SUMMARY", f)
     for _, row in summary_df.iterrows():

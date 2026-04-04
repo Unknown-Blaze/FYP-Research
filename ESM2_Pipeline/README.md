@@ -1,41 +1,97 @@
-# ESM-2 Fine-Tuning for MHC-Peptide Binding
+# ESM2 Multimodal Pipeline
 
-This project fine-tunes an ESM-2 model to predict the binding affinity (pIC50) between MHC and peptide sequences.
+This repository is organized for readers who want to reproduce a three-stage MHC-peptide binding workflow:
 
-It is driven by a configuration file (`config.yaml`) for easy experiment management and includes robust logging, checkpointing, and evaluation.
+1. Sequence model training in [sequence](sequence)
+2. Structure graph generation and GNN training in [structure](structure)
+3. Fusion/ensemble stacking at repository root
 
-## 1. Setup
+## Repository Layout
 
-### Create Conda Environment
-We recommend using Conda to manage dependencies.
+* [sequence](sequence): ESM2 fine-tuning and evaluation
+* [structure](structure): template download, graph generation, GNN training
+* root scripts: [extract_predictions.py](extract_predictions.py), [train_ensemble.py](train_ensemble.py), [extract_and_ensemble.sh](extract_and_ensemble.sh)
+* visualizations: [training_visualizations/scripts](training_visualizations/scripts), outputs in [training_visualizations/figures](training_visualizations/figures) and [training_visualizations/reports](training_visualizations/reports)
 
-1.  **Create a new environment** (e.g., named `esm`):
-    ```bash
-    conda create -n esm python=3.10
-    ```
+## Environment Setup
 
-2.  **Activate the environment:**
-    ```bash
-    conda activate esm
-    ```
+Use one environment for sequence + ensemble and one optional structure-focused conda environment.
 
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+### Option A: Pip environment (sequence + ensemble)
 
-## 2. Configuration
-
-All experiment settings are controlled by the `config.yaml` file. Before running, edit this file to:
-
-* Point `data_file` to your dataset.
-* Set your desired `output_dir`.
-* Choose your `model_name` (e.g., `facebook/esm2_t33_650M_UR50D` or `facebook/esm2_t36_3B_UR50D`).
-* Adjust hyperparameters like `batch_size`, `lr`, and `num_workers` to match your GPU (see A100 recommendations in the file).
-
-## 3. How to Run
-
-### To Start a New Training
-Use the provided shell script:
 ```bash
-./main.sh
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### Option B: Conda environment (structure pipeline)
+
+```bash
+conda env create -f structure/environment_esm_graph.yml
+conda activate esm_graph
+```
+
+## End-to-End Run Order
+
+Run from repository root unless otherwise noted.
+
+1. Sequence training/evaluation
+
+```bash
+bash sequence/train.sh
+bash sequence/test.sh
+```
+
+2. Structure pipeline
+
+```bash
+cd structure
+python download_templates.py
+python graph_generator.py
+python train_gnn_model.py
+# optional watchdog wrapper:
+# bash train_gnn_model.sh
+cd ..
+```
+
+3. Ensemble/fusion
+
+```bash
+bash extract_and_ensemble.sh
+```
+
+This executes [extract_predictions.py](extract_predictions.py) followed by [train_ensemble.py](train_ensemble.py). Legacy wrapper [run_full_pipeline.sh](run_full_pipeline.sh) delegates to the same flow.
+
+## Visualization Scripts
+
+Scripts:
+
+* [training_visualizations/scripts/generate_requested_visualizations.py](training_visualizations/scripts/generate_requested_visualizations.py)
+* [training_visualizations/scripts/visualize_training_logs.py](training_visualizations/scripts/visualize_training_logs.py)
+* [training_visualizations/scripts/auc_calc.py](training_visualizations/scripts/auc_calc.py)
+
+Run from repository root:
+
+```bash
+python training_visualizations/scripts/generate_requested_visualizations.py
+python training_visualizations/scripts/visualize_training_logs.py
+python training_visualizations/scripts/auc_calc.py
+```
+
+## Notes for Reproducibility
+
+* Primary sequence config: [sequence/config.yaml](sequence/config.yaml)
+* Integration reference config: [config_multimodal.yaml](config_multimodal.yaml)
+* Root entry scripts are path-safe and can be called from any working directory.
+
+## Generated Artifacts and Git Ignore Policy
+
+Generated files are intentionally excluded from version control via [.gitignore](.gitignore), including:
+
+* model checkpoints (`*.pt`, `*.pth`, `*.pkl`)
+* logs and run reports
+* ensemble outputs (`ensemble_meta_data.csv`, `ensemble_seed_results.csv`, `ensemble_mean_sd_summary.csv`, `final_ensemble_test_results.csv`)
+* visualization outputs under [training_visualizations/figures](training_visualizations/figures) and [training_visualizations/reports](training_visualizations/reports)
+* temporary structure chunks under structure/tmp

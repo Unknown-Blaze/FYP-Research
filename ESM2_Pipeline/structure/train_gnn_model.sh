@@ -1,7 +1,10 @@
 #!/bin/bash
 
 # Name of a separate log file just for crashes/restarts
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONITOR_LOG="training_monitor.log"
+
+cd "$ROOT_DIR"
 
 echo "=== Starting Auto-Restart Watchdog (Tmux Mode) ===" | tee -a "$MONITOR_LOG"
 

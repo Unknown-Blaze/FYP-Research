@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import joblib
 import yaml
+from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Batch
@@ -31,11 +32,20 @@ CONFIG = {
     'gnn_pep': 'structure/data/graphs/ensemble/peptide'
 }
 
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG['data_path'] = str(BASE_DIR / 'iedb_dataset.csv')
+CONFIG['output_csv'] = str(BASE_DIR / 'ensemble_meta_data.csv')
+CONFIG['esm_ckpt'] = str(BASE_DIR / 'checkpoints' / 'checkpoints_esm2_warmstart' / 'best_model.pt')
+CONFIG['esm_scaler'] = str(BASE_DIR / 'checkpoints' / 'checkpoints_esm2_warmstart' / 'label_scaler.joblib')
+CONFIG['gnn_ckpt'] = str(BASE_DIR / 'structure' / 'checkpoints' / 'gnn_physics_best.pth')
+CONFIG['gnn_mhc'] = str(BASE_DIR / 'structure' / 'data' / 'graphs' / 'ensemble' / 'mhc')
+CONFIG['gnn_pep'] = str(BASE_DIR / 'structure' / 'data' / 'graphs' / 'ensemble' / 'peptide')
+
 # ============================================================================
 # 2. SETUP & IMPORTS
 # ============================================================================
-sys.path.append(os.path.join(os.getcwd(), 'sequence'))
-sys.path.append(os.path.join(os.getcwd(), 'structure')) # Add structure folder to path
+sys.path.append(str(BASE_DIR / 'sequence'))
+sys.path.append(str(BASE_DIR / 'structure'))
 
 try:
     from train_finetune import ESM2FineTuneModel, AppConfig
@@ -53,8 +63,8 @@ def load_models(device):
     print("⏳ Loading Models...")
     
     # --- LOAD ESM ---
-    with open(CONFIG['esm_config']) as f: esm_yaml = yaml.safe_load(f)
-    esm_yaml['data_file'] = __file__ 
+    with open(BASE_DIR / CONFIG['esm_config']) as f: esm_yaml = yaml.safe_load(f)
+    esm_yaml['data_file'] = str(BASE_DIR / 'iedb_dataset.csv')
     esm_cfg = AppConfig(**esm_yaml)
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(esm_cfg.tokenizer_name)
@@ -132,6 +142,7 @@ def collate_wrapper(batch, tokenizer):
 # ============================================================================
 def main():
     device = torch.device(CONFIG['device'])
+    use_cuda = device.type == 'cuda'
     esm_model, gnn_model, tokenizer, scaler = load_models(device)
     
     print("⏳ Reading CSV...")
@@ -147,7 +158,7 @@ def main():
         shuffle=False, 
         num_workers=4, 
         collate_fn=lambda x: collate_wrapper(x, tokenizer),
-        pin_memory=True
+        pin_memory=use_cuda
     )
     
     results = []
@@ -162,7 +173,7 @@ def main():
             unified_graph = unified_graph.to(device)
             
             with torch.no_grad():
-                with torch.amp.autocast(device_type='cuda'):
+                with torch.amp.autocast(device_type='cuda', enabled=use_cuda):
                     esm_raw = esm_model(esm_batch_mhc, esm_batch_pep)
                     gnn_pred = gnn_model(unified_graph)
                 
