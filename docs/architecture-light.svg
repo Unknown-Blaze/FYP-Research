@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="940" viewBox="0 0 960 940" role="img" aria-labelledby="title desc">
+<title id="title">FYP-Research architecture</title>
+<desc id="desc">iedb_dataset.csv is split 80/10/10 with seed 42. Branch A fine-tunes ESM-2 650M with gated MHC-peptide co-attention and attention pooling. Branch B threads sequences onto four RCSB MHC templates, builds physics-feature graphs and trains a GATv2 GNN with attention fusion across templates. extract_predictions.py writes both models' predictions; train_ensemble.py fits a Ridge and an MLP stack on the validation split and reports RMSE, R2, PCC and SCC on the held-out test split.</desc>
+<defs><pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse"><path d="M20 0 H0 V20" fill="none" stroke="#E6EAEE" stroke-width="1"/></pattern><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#57606A"/></marker><marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#C2410C"/></marker></defs>
+<rect x="0.5" y="0.5" width="959" height="939" rx="14" fill="#F6F8FA"/>
+<rect x="0.5" y="0.5" width="959" height="939" rx="14" fill="url(#grid)" stroke="#D0D7DE"/>
+<text x="24" y="36" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" fill="#0F766E" font-weight="700" letter-spacing="1.2">ARCHITECTURE · FYP-RESEARCH</text>
+<text x="936" y="36" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" fill="#57606A" letter-spacing="1" text-anchor="end">MHC-PEPTIDE BINDING</text>
+<path d="M18 52 H942" stroke="#D0D7DE" stroke-width="1"/>
+<rect x="300" y="72" width="360" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="480.0" y="101.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">iedb_dataset.csv</text>
+<text x="480.0" y="121.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">IEDB PAIRS · nM → pIC50</text>
+<text x="672" y="110" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#0F766E" font-weight="700" letter-spacing="0.6">80 / 10 / 10 SPLIT · SEED 42</text>
+<path d="M380 136 V168 H200 V234" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<path d="M580 136 V168 H760 V234" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="24" y="200" width="440" height="310" rx="10" fill="none" stroke="#0F766E" stroke-width="1.3" stroke-dasharray="6 4"/>
+<text x="452" y="498" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#0F766E" font-weight="700" letter-spacing="0.6" text-anchor="end">A · SEQUENCE · sequence/</text>
+<rect x="48" y="236" width="392" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="244.0" y="265.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">ESM-2 650M encoder</text>
+<text x="244.0" y="285.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">esm2_t33_650M_UR50D · FINE-TUNED</text>
+<path d="M244 300 V322" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="48" y="324" width="392" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="244.0" y="353.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">Gated co-attention</text>
+<text x="244.0" y="373.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">MHC ↔ PEPTIDE · WARM START 0.1</text>
+<path d="M244 388 V410" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="48" y="412" width="392" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="244.0" y="441.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">Attention pooling → pIC50</text>
+<text x="244.0" y="461.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">train_finetune.py · best_model.pt</text>
+<rect x="496" y="200" width="440" height="310" rx="10" fill="none" stroke="#0F766E" stroke-width="1.3" stroke-dasharray="6 4"/>
+<text x="508" y="498" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#0F766E" font-weight="700" letter-spacing="0.6">B · STRUCTURE · structure/</text>
+<rect x="520" y="236" width="392" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="716.0" y="265.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">RCSB MHC templates</text>
+<text x="716.0" y="285.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">1HHI · 1A1M · 3VCL · 1XR8</text>
+<path d="M716 300 V322" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="520" y="324" width="392" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="716.0" y="353.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">Template threading → graphs</text>
+<text x="716.0" y="373.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">graph_generator.py · PHYSICS FEATURES</text>
+<path d="M716 388 V410" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="520" y="412" width="392" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="716.0" y="441.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">GATv2 GNN × 4 templates</text>
+<text x="716.0" y="461.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">ATTENTION FUSION · gnn_physics_best.pth</text>
+<path d="M200 476 V540 H380 V560" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<path d="M760 476 V540 H580 V560" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="280" y="562" width="400" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="480.0" y="591.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">extract_predictions.py</text>
+<text x="480.0" y="611.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">esm_pred · gnn_pred · diff → CSV</text>
+<path d="M400 626 V646 H330 V676" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<path d="M560 626 V646 H630 V676" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="176" y="656" width="608" height="222" rx="10" fill="none" stroke="#0F766E" stroke-width="1.3" stroke-dasharray="6 4"/>
+<text x="772" y="866" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#0F766E" font-weight="700" letter-spacing="0.6" text-anchor="end">train_ensemble.py · 3 META SEEDS</text>
+<rect x="200" y="678" width="260" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="330.0" y="707.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">Ridge linear stack</text>
+<text x="330.0" y="727.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">esm_pred + gnn_pred</text>
+<rect x="500" y="678" width="260" height="64" rx="6" fill="#FFFFFF" stroke="#57606A" stroke-width="1.3"/>
+<text x="630.0" y="707.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">MLP stack (64, 32)</text>
+<text x="630.0" y="727.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">+ LENGTH · pLDDT · DIFF</text>
+<text x="480" y="768" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">FIT ON THE VALIDATION SPLIT</text>
+<path d="M330 742 V776" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<path d="M630 742 V776" fill="none" stroke="#57606A" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="200" y="778" width="560" height="58" rx="6" fill="#E3F1EF" stroke="#0F766E" stroke-width="1.8"/>
+<text x="480.0" y="804.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" fill="#1F2328" font-weight="600" text-anchor="middle">Held-out test metrics</text>
+<text x="480.0" y="824.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#57606A" letter-spacing="0.6" text-anchor="middle">RMSE · R² · PCC · SCC · MEAN ± SD</text>
+<rect x="606" y="896" width="330" height="28" fill="#F6F8FA" stroke="#57606A" stroke-width="1"/>
+<text x="771.0" y="914.86" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.5" fill="#1F2328" font-weight="700" letter-spacing="0.8" text-anchor="middle">DRAWN FROM SOURCE · NOT TO SCALE</text>
+</svg>
